@@ -1,6 +1,6 @@
 # Distributed Key-Value Store
 
-A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, and consistency challenges.
+A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, snapshot recovery, and consistency challenges.
 
 ## Architecture
 
@@ -27,6 +27,7 @@ Each node stores data independently and replicates writes to all other nodes.
 
 - **Data replication** — write to any node, all nodes sync automatically
 - **Fault tolerance** — cluster keeps working when a node goes down
+- **Snapshot recovery** — restarted nodes automatically fetch full data from peers
 - **Consistency demo** — shows what happens when nodes miss updates
 - **Auto failover** — writes skip offline nodes, warn instead of crash
 
@@ -52,14 +53,19 @@ Each node stores data independently and replicates writes to all other nodes.
 节点 5003: ❌ 不在线
 ```
 
-**Consistency gap** — node rejoins but missed historical data:
+**Snapshot recovery** — node restarts and automatically recovers all historical data:
 ```
-节点 5001: {'city': 'MountainView', 'name': 'Freja'}
-节点 5002: {'city': 'MountainView', 'name': 'Freja'}
-节点 5003: {'name': 'Freja'}   ← only has data written after it rejoined
-```
+# Node 5003 was offline, missed some writes
+# On restart, it fetches a full snapshot from peers
 
-This demonstrates **eventual consistency** — a core challenge in distributed systems.
+🚀 节点启动：port 5003，peers: [5001, 5002]
+🔍 尝试从其他节点恢复数据...
+  ✅ 从节点 5001 恢复了 5 条数据
+
+节点 5001: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}
+节点 5002: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}
+节点 5003: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}  ← fully recovered!
+```
 
 ## How to Run
 
@@ -97,13 +103,14 @@ Each node exposes:
 | GET | `/get?key=<k>` | read a value |
 | GET | `/all` | dump all data |
 | GET | `/health` | health check |
+| GET | `/snapshot` | return full data dump (used for recovery) |
 | POST | `/set` | write a value (triggers replication) |
 | POST | `/internal` | receive replicated data from peers |
 
 ## Known Limitations
 
-- **No snapshot/recovery** — new nodes joining the cluster won't get historical data
 - **No leader election** — any node can accept writes (potential split-brain)
-- **In-memory only** — data lost on restart
+- **In-memory only** — data lost if all nodes restart simultaneously
+- **No conflict resolution** — if two nodes get different values for the same key while partitioned, last write wins
 
-These are intentional simplifications to focus on core concepts. Real solutions: Redis RDB snapshots, Raft consensus algorithm.
+These are intentional simplifications to focus on core concepts. Real solutions: Raft consensus algorithm, Redis RDB snapshots.
