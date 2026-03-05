@@ -1,6 +1,6 @@
 # Distributed Key-Value Store
 
-A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, and consistency challenges.
+A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, and split-brain.
 
 ## Architecture
 
@@ -29,8 +29,9 @@ Each node stores data independently and replicates writes to all other nodes.
 - **Disk persistence** — every write saved to `data_<port>.json`, survives full cluster restart
 - **Fault tolerance** — cluster keeps working when a node goes down
 - **Snapshot recovery** — restarted nodes automatically fetch full data from peers
-- **Consistency demo** — shows what happens when nodes miss updates
-- **Auto failover** — writes skip offline nodes, warn instead of crash
+- **Leader election** — lowest-port alive node becomes leader; only leader accepts writes; auto re-elect on failure
+- **Auto redirect** — writing to a follower automatically redirects to the current leader
+- **Split-brain demo** — simulate network partition and data conflict with `isolate`/`heal`
 
 ## Demo
 
@@ -118,10 +119,29 @@ Each node exposes:
 | POST | `/set` | write a value (triggers replication) |
 | POST | `/internal` | receive replicated data from peers |
 
+**Leader election** — leader goes down, cluster elects a new one automatically:
+```
+节点 5001 👑 leader: {'name': 'Freja'}
+节点 5002 🔄 follower: {'name': 'Freja'}
+节点 5003 🔄 follower: {'name': 'Freja'}
+
+# kill node 5001 (the leader)
+💥 Leader 5001 已挂掉
+
+# 5 seconds later, 5002 becomes the new leader
+> leader
+节点 5002 认为 Leader 是：5002，自己角色：leader
+
+# writing to a follower auto-redirects to leader
+> set city Cupertino 5002
+↪️  节点 5002 不是 Leader，自动转发到节点 5001
+✅ 成功：{'written_to': 5002}
+```
+
 ## Known Limitations
 
-- **No leader election** — any node can accept writes (potential split-brain)
-- **No conflict resolution** — if two nodes get different values for the same key while partitioned, last write wins
+- **Simple leader election** — based on lowest port number, not a full Raft/Paxos consensus
+- **No conflict resolution** — split-brain recovery uses last-write-wins, data may be silently lost
 
 These are intentional simplifications to focus on core concepts. Real solutions: Raft consensus algorithm, Redis RDB snapshots.
 
@@ -167,6 +187,8 @@ These are intentional simplifications to focus on core concepts. Real solutions:
 - **磁盘持久化** — 每次写入同时存入 `data_<port>.json`，全集群重启数据不丢失
 - **故障容忍** — 一个节点挂掉，集群继续正常工作
 - **快照恢复** — 节点重启时自动从其他节点拉取全量数据
+- **选主（Leader Election）** — 存活节点中端口最小的当 Leader，只有 Leader 接受写入，Leader 挂了自动重新选
+- **自动转发** — 写入 Follower 时自动重定向到 Leader，客户端无感知
 - **脑裂演示** — 模拟网络分区，展示数据不一致问题
 
 ### 如何运行
