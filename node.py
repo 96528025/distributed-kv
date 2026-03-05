@@ -4,6 +4,7 @@
 1. 存储数据（内存字典）
 2. 对外提供 HTTP 接口（读写数据）
 3. 写入时自动同步给其他节点
+4. 启动时从其他节点拉取全量数据（快照恢复）
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -58,6 +59,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/all":
             with store_lock:
                 self._respond(200, {"node": MY_PORT, "data": store})
+
+        elif self.path == "/snapshot":
+            # 把自己所有数据返回给请求方（用于新节点恢复）
+            with store_lock:
+                self._respond(200, {"node": MY_PORT, "data": dict(store)})
 
         elif self.path == "/health":
             self._respond(200, {"status": "healthy", "node": MY_PORT})
@@ -114,7 +120,33 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 关掉默认日志，用我们自己的 print
 
 
+# ── 启动时从其他节点拉取全量数据 ──────────────────────────
+def recover_from_peers():
+    """启动时向所有在线节点请求快照，合并到本地"""
+    print(f"🔍 尝试从其他节点恢复数据...")
+    recovered = False
+    for port in PEER_PORTS:
+        try:
+            url = f"http://localhost:{port}/snapshot"
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                result = json.loads(resp.read())
+                peer_data = result.get("data", {})
+                if peer_data:
+                    with store_lock:
+                        store.update(peer_data)  # 合并数据
+                    print(f"  ✅ 从节点 {port} 恢复了 {len(peer_data)} 条数据：{peer_data}")
+                    recovered = True
+                    break  # 拿到一份完整数据就够了
+        except urllib.error.URLError:
+            print(f"  ⚠️  节点 {port} 不在线，跳过")
+
+    if not recovered:
+        print(f"  ℹ️  没有在线节点，从空数据开始")
+
+
 # ── 启动服务器 ─────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"🚀 节点启动：port {MY_PORT}，peers: {PEER_PORTS}")
+    recover_from_peers()
+    print(f"✅ 节点 {MY_PORT} 就绪，当前数据：{store}")
     HTTPServer(("0.0.0.0", MY_PORT), Handler).serve_forever()
