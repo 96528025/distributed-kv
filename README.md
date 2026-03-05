@@ -124,3 +124,87 @@ Each node exposes:
 - **No conflict resolution** — if two nodes get different values for the same key while partitioned, last write wins
 
 These are intentional simplifications to focus on core concepts. Real solutions: Raft consensus algorithm, Redis RDB snapshots.
+
+**Split-brain demo** — simulate network partition and data conflict:
+```
+> set role unknown        # initial state, all nodes in sync
+> isolate 5001            # cut node 5001 off from the cluster
+> set role leader 5001    # 5001 thinks it's the leader
+> set role follower 5002  # the other side disagrees
+
+> all
+节点 5001: {'role': 'leader'}    ← isolated side
+节点 5002: {'role': 'follower'}  ← other side
+节点 5003: {'role': 'follower'}  ← other side
+
+# same key, two different values — this is split-brain
+# healing the partition: last write wins, no conflict warning
+> heal 5001
+> set role resolved 5001
+节点 5001: {'role': 'resolved'}
+节点 5002: {'role': 'resolved'}
+节点 5003: {'role': 'resolved'}  ← 'leader' value silently lost!
+```
+
+---
+
+## 中文说明
+
+### 这是什么？
+
+用 Python 从零手写的分布式键值数据库，类似 Redis 集群的简化版。演示了分布式系统的核心概念：数据复制、持久化、故障容忍、快照恢复、脑裂问题。
+
+### 架构
+
+三个节点运行在本地不同端口，互相同步数据：
+- 写入任意节点 → 自动同步到其他所有节点
+- 节点挂了 → 其他节点继续工作
+- 节点重启 → 先从磁盘恢复，再从其他节点补全
+
+### 功能列表
+
+- **数据复制** — 写入一个节点，所有节点自动同步
+- **磁盘持久化** — 每次写入同时存入 `data_<port>.json`，全集群重启数据不丢失
+- **故障容忍** — 一个节点挂掉，集群继续正常工作
+- **快照恢复** — 节点重启时自动从其他节点拉取全量数据
+- **脑裂演示** — 模拟网络分区，展示数据不一致问题
+
+### 如何运行
+
+```bash
+# 终端 1：启动集群
+bash start.sh
+
+# 终端 2：启动客户端
+python3 client.py
+```
+
+**客户端命令：**
+```
+set <key> <value> [port]   # 写入数据（默认写到节点 5001）
+get <key> [port]           # 读取数据
+all                        # 查看所有节点的数据
+isolate <port>             # 孤立某个节点（模拟脑裂）
+heal <port>                # 恢复某个节点的网络连接
+quit                       # 退出
+```
+
+### API 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/get?key=<k>` | 读取一个值 |
+| GET | `/all` | 查看所有数据 |
+| GET | `/health` | 健康检查 |
+| GET | `/snapshot` | 返回全量数据（用于新节点恢复） |
+| GET | `/isolate` | 进入孤立模式（模拟脑裂） |
+| GET | `/heal` | 退出孤立模式 |
+| POST | `/set` | 写入数据（触发同步） |
+| POST | `/internal` | 接收其他节点的同步数据 |
+
+### 已知局限
+
+- **没有选主（Leader Election）** — 任何节点都能接受写入，存在脑裂风险
+- **没有冲突解决** — 脑裂恢复后，最后一次写入覆盖其他值，旧数据无警告丢失
+
+真实系统的解决方案：Raft 共识算法、Redis RDB 快照。
