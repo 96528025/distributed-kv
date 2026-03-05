@@ -26,6 +26,7 @@ PEER_PORTS = [int(p) for p in sys.argv[2:]]
 store = {}
 store_lock = threading.Lock()  # 防止多个请求同时写入，造成数据混乱
 DISK_FILE = f"data_{MY_PORT}.json"  # 每个节点有自己的文件
+isolated = False  # 脑裂模拟：True 时节点拒绝同步给其他节点
 
 
 # ── 持久化：读写磁盘 ───────────────────────────────────────
@@ -47,6 +48,9 @@ def load_from_disk():
 # ── 同步给其他节点 ─────────────────────────────────────────
 def replicate(key, value):
     """把写入操作同步给所有其他节点"""
+    if isolated:
+        print(f"  🚫 节点 {MY_PORT} 已孤立，跳过所有同步（脑裂状态）")
+        return
     for port in PEER_PORTS:
         try:
             url = f"http://localhost:{port}/internal"
@@ -65,6 +69,7 @@ class Handler(BaseHTTPRequestHandler):
     # GET /get?key=name  → 读取数据
     # GET /all           → 查看所有数据
     def do_GET(self):
+        global isolated
         if self.path.startswith("/get"):
             key = self.path.split("=")[-1]
             with store_lock:
@@ -87,12 +92,23 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/health":
             self._respond(200, {"status": "healthy", "node": MY_PORT})
 
+        elif self.path == "/isolate":
+            isolated = True
+            print(f"\n🔴 节点 {MY_PORT} 进入孤立模式（模拟脑裂）")
+            self._respond(200, {"status": "isolated", "node": MY_PORT})
+
+        elif self.path == "/heal":
+            isolated = False
+            print(f"\n🟢 节点 {MY_PORT} 恢复正常（脑裂解除）")
+            self._respond(200, {"status": "healed", "node": MY_PORT})
+
         else:
             self._respond(404, {"error": "unknown endpoint"})
 
     # POST /set          → 写入数据（同时同步给其他节点）
     # POST /internal     → 接收其他节点同步过来的数据
     def do_POST(self):
+        global isolated
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
 
@@ -119,6 +135,10 @@ class Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/internal":
             # 来自其他节点的同步请求，只写入，不再转发
+            if isolated:
+                print(f"\n🚫 拒绝同步（孤立状态）")
+                self._respond(503, {"error": "node is isolated"})
+                return
             key = body.get("key")
             value = body.get("value")
             with store_lock:

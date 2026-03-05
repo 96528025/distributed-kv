@@ -92,12 +92,22 @@ def main():
         elif cmd == "all":
             show_all()
 
+        elif cmd == "isolate" and len(parts) >= 2:
+            port = int(parts[1])
+            result = request("GET", port, "/isolate")
+            print(f"   🔴 节点 {port} 已孤立：{result}")
+
+        elif cmd == "heal" and len(parts) >= 2:
+            port = int(parts[1])
+            result = request("GET", port, "/heal")
+            print(f"   🟢 节点 {port} 已恢复：{result}")
+
         elif cmd == "quit":
             print("👋 退出")
             break
 
         else:
-            print("用法：set <key> <value> [port]  |  get <key> [port]  |  all  |  quit")
+            print("用法：set <key> <value> [port]  |  get <key> [port]  |  all  |  isolate <port>  |  heal <port>  |  quit")
 
 
 if __name__ == "__main__":
