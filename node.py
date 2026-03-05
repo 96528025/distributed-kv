@@ -5,6 +5,7 @@
 2. 对外提供 HTTP 接口（读写数据）
 3. 写入时自动同步给其他节点
 4. 启动时从其他节点拉取全量数据（快照恢复）
+5. 每次写入同时持久化到磁盘（重启不丢数据）
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,6 +14,7 @@ import sys
 import urllib.request
 import urllib.error
 import threading
+import os
 
 # ── 启动参数 ──────────────────────────────────────────────
 # 运行方式: python3 node.py <port> <peer1_port> <peer2_port>
@@ -23,6 +25,23 @@ PEER_PORTS = [int(p) for p in sys.argv[2:]]
 # ── 数据存储（内存字典） ───────────────────────────────────
 store = {}
 store_lock = threading.Lock()  # 防止多个请求同时写入，造成数据混乱
+DISK_FILE = f"data_{MY_PORT}.json"  # 每个节点有自己的文件
+
+
+# ── 持久化：读写磁盘 ───────────────────────────────────────
+def save_to_disk():
+    """把当前 store 写入 JSON 文件"""
+    with open(DISK_FILE, "w") as f:
+        json.dump(store, f)
+
+def load_from_disk():
+    """从 JSON 文件恢复 store（启动时调用）"""
+    if os.path.exists(DISK_FILE):
+        with open(DISK_FILE, "r") as f:
+            store.update(json.load(f))
+        print(f"  💾 从磁盘恢复了 {len(store)} 条数据：{store}")
+    else:
+        print(f"  💾 没有磁盘文件，从空数据开始")
 
 
 # ── 同步给其他节点 ─────────────────────────────────────────
@@ -84,6 +103,7 @@ class Handler(BaseHTTPRequestHandler):
             # 写入本节点
             with store_lock:
                 store[key] = value
+                save_to_disk()
             print(f"\n📝 写入: {key} = {value}")
 
             # 同步给其他节点
@@ -103,6 +123,7 @@ class Handler(BaseHTTPRequestHandler):
             value = body.get("value")
             with store_lock:
                 store[key] = value
+                save_to_disk()
             print(f"\n📨 收到同步: {key} = {value}")
             self._respond(200, {"status": "ok"})
 
@@ -147,6 +168,7 @@ def recover_from_peers():
 # ── 启动服务器 ─────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"🚀 节点启动：port {MY_PORT}，peers: {PEER_PORTS}")
-    recover_from_peers()
+    load_from_disk()      # 先从磁盘恢复
+    recover_from_peers()  # 再从其他节点补充更新的数据
     print(f"✅ 节点 {MY_PORT} 就绪，当前数据：{store}")
     HTTPServer(("0.0.0.0", MY_PORT), Handler).serve_forever()
