@@ -1,6 +1,6 @@
 # Distributed Key-Value Store
 
-A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, snapshot recovery, and consistency challenges.
+A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, and consistency challenges.
 
 ## Architecture
 
@@ -26,6 +26,7 @@ Each node stores data independently and replicates writes to all other nodes.
 ## Features
 
 - **Data replication** — write to any node, all nodes sync automatically
+- **Disk persistence** — every write saved to `data_<port>.json`, survives full cluster restart
 - **Fault tolerance** — cluster keeps working when a node goes down
 - **Snapshot recovery** — restarted nodes automatically fetch full data from peers
 - **Consistency demo** — shows what happens when nodes miss updates
@@ -51,6 +52,16 @@ Each node stores data independently and replicates writes to all other nodes.
 节点 5001: {'name': 'Freja', 'city': 'MountainView'}
 节点 5002: {'name': 'Freja', 'city': 'MountainView'}
 节点 5003: ❌ 不在线
+```
+
+**Disk persistence** — full cluster restart, data survives:
+```
+# All nodes killed (simulating power failure)
+# data_5001.json: {"name": "Freja", "city": "MountainView"}
+
+# On restart, each node reads its own disk file first
+💾 从磁盘恢复了 2 条数据：{'name': 'Freja', 'city': 'MountainView'}
+✅ 节点 5001 就绪，当前数据：{'name': 'Freja', 'city': 'MountainView'}
 ```
 
 **Snapshot recovery** — node restarts and automatically recovers all historical data:
@@ -110,7 +121,6 @@ Each node exposes:
 ## Known Limitations
 
 - **No leader election** — any node can accept writes (potential split-brain)
-- **In-memory only** — data lost if all nodes restart simultaneously
 - **No conflict resolution** — if two nodes get different values for the same key while partitioned, last write wins
 
 These are intentional simplifications to focus on core concepts. Real solutions: Raft consensus algorithm, Redis RDB snapshots.
