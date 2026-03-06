@@ -7,6 +7,7 @@
 4. 启动时从其他节点拉取全量数据（快照恢复）
 5. 每次写入同时持久化到磁盘（重启不丢数据）
 6. 后台选主：存活节点中端口最小的是 Leader，只有 Leader 接受写入
+7. 支持列表类型：lpush（头部插入）、lrange（读取片段）
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -110,6 +111,20 @@ class Handler(BaseHTTPRequestHandler):
             with store_lock:
                 self._respond(200, {"node": MY_PORT, "data": store})
 
+        elif self.path.startswith("/lrange"):
+            # GET /lrange?key=messages&start=0&end=49
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            key = params.get("key", [None])[0]
+            start = int(params.get("start", [0])[0])
+            end = int(params.get("end", [49])[0])
+            with store_lock:
+                val = store.get(key, [])
+            if not isinstance(val, list):
+                self._respond(400, {"error": f"key '{key}' is not a list"})
+            else:
+                self._respond(200, {"key": key, "items": val[start:end+1], "from_node": MY_PORT})
+
         elif self.path == "/snapshot":
             with store_lock:
                 self._respond(200, {"node": MY_PORT, "data": dict(store)})
@@ -171,6 +186,25 @@ class Handler(BaseHTTPRequestHandler):
                 "written_to": MY_PORT
             })
 
+        elif self.path == "/lpush":
+            key = body.get("key")
+            value = body.get("value")
+
+            # 只有 Leader 接受写入
+            if leader_port is not None and MY_PORT != leader_port:
+                self._respond(403, {"error": "not the leader", "leader": leader_port})
+                return
+
+            with store_lock:
+                if key not in store or not isinstance(store[key], list):
+                    store[key] = []
+                store[key].append(value)
+                full_list = list(store[key])
+                save_to_disk()
+            print(f"\n📝 [Leader] lpush: {key} ← {value}")
+            replicate(key, full_list)
+            self._respond(200, {"status": "ok", "key": key, "length": len(full_list)})
+
         elif self.path == "/internal":
             if isolated:
                 print(f"\n🚫 拒绝同步（孤立状态）")
@@ -181,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
             with store_lock:
                 store[key] = value
                 save_to_disk()
-            print(f"\n📨 收到同步: {key} = {value}")
+            print(f"\n📨 收到同步: {key} = {value!r:.60}")
             self._respond(200, {"status": "ok"})
 
         else:
