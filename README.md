@@ -1,99 +1,72 @@
-# Distributed Key-Value Store
+# Distributed Key-Value Store + Real-Time Chat
 
-A Redis-inspired distributed key-value store built from scratch in Python. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, and split-brain.
+A Redis-inspired distributed key-value store built from scratch in Python, extended into a full distributed chat system. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, split-brain, and horizontal scaling.
 
 ## Architecture
 
 ```
-  Client
-    │
-    ▼
-┌─────────┐     replicates     ┌─────────┐
-│ Node A  │ ─────────────────► │ Node B  │
-│ :5001   │ ◄───────────────── │ :5002   │
-└─────────┘                    └─────────┘
-     │                              │
-     └──────────┬───────────────────┘
-                ▼
-          ┌─────────┐
-          │ Node C  │
-          │ :5003   │
-          └─────────┘
+Alice ──WebSocket──► Chat Server :9001 ──┐
+Bob   ──WebSocket──► Chat Server :9002 ──┼──► KV Cluster :5001/:5002/:5003
+Carol ──WebSocket──► Chat Server :9003 ──┘    (message persistence + replication)
 ```
 
-Each node stores data independently and replicates writes to all other nodes.
+Each Chat Server is stateless. All message history is stored in the distributed KV cluster. If a Chat Server goes down, clients automatically reconnect to another one — and message history is preserved.
 
 ## Features
 
+**Distributed KV Store**
 - **Data replication** — write to any node, all nodes sync automatically
 - **Disk persistence** — every write saved to `data_<port>.json`, survives full cluster restart
 - **Fault tolerance** — cluster keeps working when a node goes down
 - **Snapshot recovery** — restarted nodes automatically fetch full data from peers
 - **Leader election** — lowest-port alive node becomes leader; only leader accepts writes; auto re-elect on failure
 - **Auto redirect** — writing to a follower automatically redirects to the current leader
+- **List type** — `lpush` / `lrange` support for storing message history
 - **Split-brain demo** — simulate network partition and data conflict with `isolate`/`heal`
 
-## Demo
+**Distributed Chat**
+- **Multi-server** — 3 Chat Servers, clients auto-reconnect on failure
+- **Message history** — new users receive last 50 messages on connect (stored in KV cluster)
+- **Persistent messages** — chat history survives full cluster restart
+- **Load tested** — 200 concurrent users: 100% success rate, 163 msg/s, 0.04ms avg latency
 
-**Normal replication** — write once, all nodes get it:
-```
-> set name Freja
-📝 写入 [name = Freja] 到节点 5001
-  ✅ 同步到节点 5002 成功
-  ✅ 同步到节点 5003 成功
+## Load Test Results
 
-> all
-节点 5001: {'name': 'Freja'}
-节点 5002: {'name': 'Freja'}
-节点 5003: {'name': 'Freja'}
-```
+| Users | Success Rate | Throughput | Avg Latency |
+|-------|-------------|------------|-------------|
+| 50    | 100%        | 41.5 msg/s | 0.04ms      |
+| 200   | 100%        | 163 msg/s  | 0.04ms      |
+| 1000  | 25%         | 200 msg/s  | 0.03ms      |
 
-**Node failure** — one node goes down, others keep working:
-```
-节点 5001: {'name': 'Freja', 'city': 'MountainView'}
-节点 5002: {'name': 'Freja', 'city': 'MountainView'}
-节点 5003: ❌ 不在线
-```
-
-**Disk persistence** — full cluster restart, data survives:
-```
-# All nodes killed (simulating power failure)
-# data_5001.json: {"name": "Freja", "city": "MountainView"}
-
-# On restart, each node reads its own disk file first
-💾 从磁盘恢复了 2 条数据：{'name': 'Freja', 'city': 'MountainView'}
-✅ 节点 5001 就绪，当前数据：{'name': 'Freja', 'city': 'MountainView'}
-```
-
-**Snapshot recovery** — node restarts and automatically recovers all historical data:
-```
-# Node 5003 was offline, missed some writes
-# On restart, it fetches a full snapshot from peers
-
-🚀 节点启动：port 5003，peers: [5001, 5002]
-🔍 尝试从其他节点恢复数据...
-  ✅ 从节点 5001 恢复了 5 条数据
-
-节点 5001: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}
-节点 5002: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}
-节点 5003: {'name': 'Freja', 'city': 'MountainView', 'avatar': 'GGBond', ...}  ← fully recovered!
-```
+Bottleneck: connection count per Chat Server (~80 concurrent), not latency. Linear scaling — doubling servers doubles capacity.
 
 ## How to Run
 
 ```bash
-# Terminal 1: start the cluster
+# Terminal 1: start the KV cluster
 bash start.sh
 
-# Terminal 2: interact with the cluster
-python3 client.py
+# Terminal 2: start Chat Servers
+source ~/Desktop/chat-room/venv/bin/activate
+python3 chat_server.py 9001 &
+python3 chat_server.py 9002 &
+python3 chat_server.py 9003 &
+
+# Terminal 3+: connect as a user
+python3 chat_client.py
+
+# Load test
+python3 load_test.py
 ```
 
-**Client commands:**
+**KV client commands:**
 ```
-set <key> <value> [port]   # write data (default: node 5001)
-get <key> [port]           # read data (default: node 5001)
+set <key> <value> [port]   # write data
+get <key> [port]           # read data
 all                        # show all nodes' data
+leader                     # show current leader
+isolate <port>             # isolate a node (split-brain demo)
+heal <port>                # reconnect isolated node
 quit                       # exit
 ```
 
@@ -101,132 +74,66 @@ quit                       # exit
 
 ```
 distributed-kv/
-├── node.py      # each node: HTTP server + in-memory store + replication
-├── client.py    # interactive CLI client
-└── start.sh     # starts all 3 nodes
+├── node.py          # KV node: HTTP server + replication + leader election + list type
+├── client.py        # interactive CLI for the KV store
+├── chat_server.py   # WebSocket chat server backed by KV cluster
+├── chat_client.py   # chat client with auto-reconnect
+├── load_test.py     # concurrent load tester
+├── start.sh         # start all 3 KV nodes
+└── start_chat.sh    # start all 3 Chat Servers
 ```
 
-## API Endpoints
-
-Each node exposes:
+## API Endpoints (KV Node)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/get?key=<k>` | read a value |
+| GET | `/lrange?key=<k>&start=0&end=49` | read a list range |
 | GET | `/all` | dump all data |
 | GET | `/health` | health check |
-| GET | `/snapshot` | return full data dump (used for recovery) |
-| POST | `/set` | write a value (triggers replication) |
+| GET | `/snapshot` | full data dump (used for recovery) |
+| GET | `/leader` | current leader info |
+| GET | `/isolate` | enter isolated mode (split-brain demo) |
+| GET | `/heal` | exit isolated mode |
+| POST | `/set` | write a string value (triggers replication) |
+| POST | `/lpush` | append to a list (triggers replication) |
 | POST | `/internal` | receive replicated data from peers |
-
-**Leader election** — leader goes down, cluster elects a new one automatically:
-```
-节点 5001 👑 leader: {'name': 'Freja'}
-节点 5002 🔄 follower: {'name': 'Freja'}
-节点 5003 🔄 follower: {'name': 'Freja'}
-
-# kill node 5001 (the leader)
-💥 Leader 5001 已挂掉
-
-# 5 seconds later, 5002 becomes the new leader
-> leader
-节点 5002 认为 Leader 是：5002，自己角色：leader
-
-# writing to a follower auto-redirects to leader
-> set city Cupertino 5002
-↪️  节点 5002 不是 Leader，自动转发到节点 5001
-✅ 成功：{'written_to': 5002}
-```
 
 ## Known Limitations
 
-- **Simple leader election** — based on lowest port number, not a full Raft/Paxos consensus
-- **No conflict resolution** — split-brain recovery uses last-write-wins, data may be silently lost
+- **Simple leader election** — based on lowest port number, not Raft/Paxos consensus
+- **No conflict resolution** — split-brain recovery uses last-write-wins
+- **Single write leader** — KV write throughput limited by one leader node; needs sharding to scale further
 
-These are intentional simplifications to focus on core concepts. Real solutions: Raft consensus algorithm, Redis RDB snapshots.
-
-**Split-brain demo** — simulate network partition and data conflict:
-```
-> set role unknown        # initial state, all nodes in sync
-> isolate 5001            # cut node 5001 off from the cluster
-> set role leader 5001    # 5001 thinks it's the leader
-> set role follower 5002  # the other side disagrees
-
-> all
-节点 5001: {'role': 'leader'}    ← isolated side
-节点 5002: {'role': 'follower'}  ← other side
-节点 5003: {'role': 'follower'}  ← other side
-
-# same key, two different values — this is split-brain
-# healing the partition: last write wins, no conflict warning
-> heal 5001
-> set role resolved 5001
-节点 5001: {'role': 'resolved'}
-节点 5002: {'role': 'resolved'}
-节点 5003: {'role': 'resolved'}  ← 'leader' value silently lost!
-```
+Real solutions: Raft consensus, Redis Cluster sharding.
 
 ---
 
 ## 中文说明
 
-### 这是什么？
-
-用 Python 从零手写的分布式键值数据库，类似 Redis 集群的简化版。演示了分布式系统的核心概念：数据复制、持久化、故障容忍、快照恢复、脑裂问题。
-
-### 架构
-
-三个节点运行在本地不同端口，互相同步数据：
-- 写入任意节点 → 自动同步到其他所有节点
-- 节点挂了 → 其他节点继续工作
-- 节点重启 → 先从磁盘恢复，再从其他节点补全
-
-### 功能列表
-
-- **数据复制** — 写入一个节点，所有节点自动同步
-- **磁盘持久化** — 每次写入同时存入 `data_<port>.json`，全集群重启数据不丢失
-- **故障容忍** — 一个节点挂掉，集群继续正常工作
-- **快照恢复** — 节点重启时自动从其他节点拉取全量数据
-- **选主（Leader Election）** — 存活节点中端口最小的当 Leader，只有 Leader 接受写入，Leader 挂了自动重新选
-- **自动转发** — 写入 Follower 时自动重定向到 Leader，客户端无感知
-- **脑裂演示** — 模拟网络分区，展示数据不一致问题
+用 Python 从零手写的分布式键值数据库，升级版包含实时聊天室。演示了分布式系统核心概念：数据复制、持久化、故障容忍、快照恢复、脑裂、水平扩展。
 
 ### 如何运行
 
 ```bash
-# 终端 1：启动集群
+# 终端 1：启动 KV 集群
 bash start.sh
 
-# 终端 2：启动客户端
-python3 client.py
+# 终端 2：启动聊天服务器
+source ~/Desktop/chat-room/venv/bin/activate
+python3 chat_server.py 9001 &
+python3 chat_server.py 9002 &
+python3 chat_server.py 9003 &
+
+# 终端 3+：启动客户端
+python3 chat_client.py
+
+# 压力测试
+python3 load_test.py
 ```
 
-**客户端命令：**
-```
-set <key> <value> [port]   # 写入数据（默认写到节点 5001）
-get <key> [port]           # 读取数据
-all                        # 查看所有节点的数据
-isolate <port>             # 孤立某个节点（模拟脑裂）
-heal <port>                # 恢复某个节点的网络连接
-quit                       # 退出
-```
+### 压力测试结论
 
-### API 接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/get?key=<k>` | 读取一个值 |
-| GET | `/all` | 查看所有数据 |
-| GET | `/health` | 健康检查 |
-| GET | `/snapshot` | 返回全量数据（用于新节点恢复） |
-| GET | `/isolate` | 进入孤立模式（模拟脑裂） |
-| GET | `/heal` | 退出孤立模式 |
-| POST | `/set` | 写入数据（触发同步） |
-| POST | `/internal` | 接收其他节点的同步数据 |
-
-### 已知局限
-
-- **没有选主（Leader Election）** — 任何节点都能接受写入，存在脑裂风险
-- **没有冲突解决** — 脑裂恢复后，最后一次写入覆盖其他值，旧数据无警告丢失
-
-真实系统的解决方案：Raft 共识算法、Redis RDB 快照。
+- 200 并发用户：100% 连接成功，163 消息/秒，0.04ms 平均延迟
+- 1000 并发用户：25% 连接成功，瓶颈是每台服务器约 80 并发连接上限
+- 扩展方案：增加 Chat Server 数量（线性扩展），KV 层需分片突破写入瓶颈
