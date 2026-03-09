@@ -131,7 +131,7 @@ async def handle(websocket):
 async def main():
     print(f"🚀 Chat Server 启动：ws://localhost:{MY_PORT}")
     print(f"   依赖 KV 集群：{KV_NODES}")
-    async with websockets.serve(handle, "localhost", MY_PORT):
+    async with websockets.serve(handle, "0.0.0.0", MY_PORT):
         await asyncio.Future()
 
 

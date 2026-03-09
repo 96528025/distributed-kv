@@ -7,18 +7,25 @@
 import asyncio
 import websockets
 
-CHAT_SERVERS = [9001, 9002, 9003]
+# 本地模式：CHAT_SERVERS = [("localhost", 9001), ("localhost", 9002), ("localhost", 9003)]
+# 云端模式：
+CHAT_SERVERS = [
+    ("98.92.66.64", 9001),    # Virginia
+    ("54.245.42.170", 9002),  # Oregon
+    ("54.171.104.70", 9003),  # Ireland
+]
 
 
 async def connect_to_server():
-    """依次尝试连接各台 Chat Server，返回 (websocket, port)"""
-    for port in CHAT_SERVERS:
+    """依次尝试连接各台 Chat Server，返回 (websocket, addr)"""
+    for host, port in CHAT_SERVERS:
         try:
-            print(f"🔌 尝试连接 Chat Server {port}...")
-            ws = await websockets.connect(f"ws://localhost:{port}")
-            return ws, port
+            addr = f"{host}:{port}"
+            print(f"🔌 尝试连接 Chat Server {addr}...")
+            ws = await websockets.connect(f"ws://{host}:{port}")
+            return ws, addr
         except Exception:
-            print(f"   ❌ {port} 不可用")
+            print(f"   ❌ {addr} 不可用")
     return None, None
 
 
