@@ -119,8 +119,9 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 
 ```
 distributed-kv/
-├── node.py            # KV node: replication + leader election + list type
-├── node_sharded.py    # KV node: consistent hashing sharding (no single leader)
+├── node.py            # KV node v1: replication + simple leader election (min port)
+├── node_sharded.py    # KV node v2: consistent hashing sharding (no single leader)
+├── node_raft.py       # KV node v3: Raft consensus (real leader election + log replication)
 ├── client.py          # interactive CLI for the KV store
 ├── chat_server.py     # WebSocket chat server backed by KV cluster
 ├── chat_client.py     # chat client with auto-reconnect
@@ -189,7 +190,44 @@ Added list type to KV store, built Chat Servers on top, load tested.
 
 ---
 
-### Day 3 — AWS Cloud Deployment / 第三天：AWS 云端部署
+### Day 3 — AWS Cloud Deployment + Sharding + Raft / 第三天：AWS 云端部署 + 分片 + Raft
+
+**Consistent Hashing Sharding (`node_sharded.py`) / 一致性哈希分片**
+
+Each key is assigned to a node via `MD5(key) % num_nodes`. Writes and reads automatically forwarded to the correct node. No single leader bottleneck — all nodes handle writes in parallel.
+
+每个 key 通过 `MD5(key) % 节点数` 分配到固定节点。写入和读取自动转发给正确节点，三台都能处理写入，无单点瓶颈。
+
+```
+set user:alice  → hash → node 5001 (direct write)
+set chat:msg    → hash → node 5002 (forwarded)
+set cache:home  → hash → node 5003 (forwarded)
+```
+
+**Raft Consensus Algorithm (`node_raft.py`) / Raft 共识算法**
+
+Replaces fake "min port = leader" with real consensus:
+- **Terms**: monotonically increasing epoch; stale leaders step down automatically
+- **Election**: randomized timeouts → first to timeout requests votes → majority wins
+- **Log replication**: writes appended to log first, committed only after majority ACK
+- **Heartbeats**: leader sends periodic heartbeats to prevent unnecessary re-elections
+
+替换掉"最小端口当 Leader"的假方案，实现真正的共识：
+- **任期**：单调递增，过期 Leader 自动下台
+- **选举**：随机超时，先超时的发起投票，多数票当选
+- **日志复制**：写入先进日志，多数节点确认后才 commit
+- **心跳**：Leader 定期发心跳，防止不必要的重新选举
+
+**Problems & Solutions / 遇到的问题：**
+
+| Problem / 问题 | Solution / 解决方法 |
+|---------------|-------------------|
+| Raft node kept re-electing before peers started | Normal behavior — no majority available until all 3 nodes up; won on Term 42 once all started |
+| Term number jumped to 42 | Each failed election increments term; expected when nodes start one by one |
+
+---
+
+### Day 3b — AWS Cloud Deployment / 第三天：AWS 云端部署
 
 Deployed the full stack across 3 AWS EC2 regions.
 
@@ -212,8 +250,9 @@ Deployed the full stack across 3 AWS EC2 regions.
 
 ## Known Limitations / 已知局限
 
-- **Simple leader election** (`node.py`) — based on lowest port number, not Raft/Paxos / 选主基于端口号，非真正共识算法
+- **Simple leader election** (`node.py`) — based on lowest port number, not consensus / 选主基于端口号，非真正共识算法
 - **No replication per shard** (`node_sharded.py`) — if a node dies, its keys are unavailable / 分片版无副本，节点挂了该分片不可用
-- **No conflict resolution** — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
+- **Raft without log compaction** (`node_raft.py`) — log grows unbounded; real systems use snapshots / Raft 没有日志压缩，真实系统需要快照
+- **No conflict resolution** (`node.py`) — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
 
-Real solutions: Raft consensus algorithm, Redis Cluster sharding with replicas. / 真实解决方案：Raft 共识算法、Redis Cluster 带副本的分片。
+Next steps: Raft log compaction, sharding with per-shard replication (like CockroachDB). / 下一步：Raft 日志压缩、每个分片有副本（类似 CockroachDB）。
