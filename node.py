@@ -20,9 +20,23 @@ import os
 import time
 
 # ── 启动参数 ──────────────────────────────────────────────
+# 支持两种格式：
+#   本地模式：python3 node.py 5001 5002 5003
+#   跨机器：  python3 node.py 5001 1.2.3.4:5002 5.6.7.8:5003
 MY_PORT = int(sys.argv[1])
-PEER_PORTS = [int(p) for p in sys.argv[2:]]
+PEER_MAP = {}  # { port: host }
+for p in sys.argv[2:]:
+    if ':' in p:
+        host, port = p.rsplit(':', 1)
+        PEER_MAP[int(port)] = host
+    else:
+        PEER_MAP[int(p)] = 'localhost'
+PEER_PORTS = list(PEER_MAP.keys())
 ALL_PORTS = sorted([MY_PORT] + PEER_PORTS)
+
+def peer_url(port, path):
+    host = PEER_MAP.get(port, 'localhost')
+    return f"http://{host}:{port}{path}"
 
 # ── 状态变量 ───────────────────────────────────────────────
 store = {}
@@ -53,7 +67,8 @@ def elect_leader():
     alive = []
     for port in ALL_PORTS:
         try:
-            url = f"http://localhost:{port}/health"
+            host = PEER_MAP.get(port, 'localhost')
+            url = f"http://{host}:{port}/health"
             urllib.request.urlopen(url, timeout=1)
             alive.append(port)
         except Exception:
@@ -82,7 +97,7 @@ def replicate(key, value):
         return
     for port in PEER_PORTS:
         try:
-            url = f"http://localhost:{port}/internal"
+            url = peer_url(port, "/internal")
             data = json.dumps({"key": key, "value": value}).encode()
             req = urllib.request.Request(url, data=data, method="POST")
             req.add_header("Content-type", "application/json")
@@ -238,7 +253,7 @@ def recover_from_peers():
     recovered = False
     for port in PEER_PORTS:
         try:
-            url = f"http://localhost:{port}/snapshot"
+            url = peer_url(port, "/snapshot")
             with urllib.request.urlopen(url, timeout=2) as resp:
                 result = json.loads(resp.read())
                 peer_data = result.get("data", {})

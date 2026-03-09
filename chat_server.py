@@ -13,8 +13,22 @@ import json
 import sys
 
 # ── 配置 ─────────────────────────────────────────────────
+# 用法：python3 chat_server.py <ws_port> <kv_host:port> ...
+# 例：  python3 chat_server.py 9001 98.92.66.64:5001 54.245.42.170:5002 54.171.104.70:5003
 MY_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9001
-KV_NODES = [5001, 5002, 5003]   # 分布式 KV 集群
+
+# 解析 KV 节点地址，支持 host:port 或纯 port（localhost）
+def parse_kv_nodes(args):
+    nodes = []
+    for a in args:
+        if ':' in a:
+            host, port = a.rsplit(':', 1)
+            nodes.append((host, int(port)))
+        else:
+            nodes.append(('localhost', int(a)))
+    return nodes if nodes else [('localhost', 5001), ('localhost', 5002), ('localhost', 5003)]
+
+KV_NODES = parse_kv_nodes(sys.argv[2:])
 HISTORY_KEY = "chat:messages"   # 消息存在 KV 里的 key
 MAX_HISTORY = 50                # 最多保存多少条历史
 
@@ -25,9 +39,12 @@ clients = {}  # { websocket: 昵称 }
 # ── 和 KV 集群通信 ────────────────────────────────────
 def kv_request(method, path, data=None):
     """找到 Leader 节点，发请求"""
-    for port in KV_NODES:
+    # 建立 port -> host 映射，方便 leader 重定向
+    port_to_host = {port: host for host, port in KV_NODES}
+
+    for host, port in KV_NODES:
         try:
-            url = f"http://localhost:{port}{path}"
+            url = f"http://{host}:{port}{path}"
             if data:
                 body = json.dumps(data).encode()
                 req = urllib.request.Request(url, data=body, method=method)
@@ -38,11 +55,11 @@ def kv_request(method, path, data=None):
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             result = json.loads(e.read())
-            # 被转发到 leader
             if result.get("error") == "not the leader":
-                leader = result.get("leader")
+                leader_port = result.get("leader")
+                leader_host = port_to_host.get(leader_port, 'localhost')
                 try:
-                    url = f"http://localhost:{leader}{path}"
+                    url = f"http://{leader_host}:{leader_port}{path}"
                     body = json.dumps(data).encode()
                     req = urllib.request.Request(url, data=body, method=method)
                     req.add_header("Content-type", "application/json")
