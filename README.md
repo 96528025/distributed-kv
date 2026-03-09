@@ -1,8 +1,8 @@
 # Distributed KV Store + Real-Time Chat / 分布式键值存储 + 实时聊天室
 
-A Redis-inspired distributed key-value store built from scratch in Python, extended into a full distributed chat system deployed across 3 AWS regions. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, split-brain, horizontal scaling, and cloud deployment.
+A Redis-inspired distributed key-value store built from scratch in Python, extended into a full distributed chat system deployed across 3 AWS regions. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, split-brain, horizontal scaling, consistent hashing sharding, and cloud deployment.
 
-用 Python 从零手写的分布式键值数据库，升级为完整的分布式聊天系统，部署在 AWS 三大洲。演示了分布式系统核心概念：数据复制、持久化、故障容忍、快照恢复、选主、脑裂、水平扩展和云端部署。
+用 Python 从零手写的分布式键值数据库，升级为完整的分布式聊天系统，部署在 AWS 三大洲。演示了分布式系统核心概念：数据复制、持久化、故障容忍、快照恢复、选主、脑裂、水平扩展、一致性哈希分片和云端部署。
 
 ---
 
@@ -119,13 +119,14 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 
 ```
 distributed-kv/
-├── node.py          # KV node: HTTP server + replication + leader election + list type
-├── client.py        # interactive CLI for the KV store
-├── chat_server.py   # WebSocket chat server backed by KV cluster
-├── chat_client.py   # chat client with auto-reconnect
-├── load_test.py     # concurrent load tester
-├── start.sh         # start all 3 KV nodes (local)
-└── start_chat.sh    # start all 3 Chat Servers (local)
+├── node.py            # KV node: replication + leader election + list type
+├── node_sharded.py    # KV node: consistent hashing sharding (no single leader)
+├── client.py          # interactive CLI for the KV store
+├── chat_server.py     # WebSocket chat server backed by KV cluster
+├── chat_client.py     # chat client with auto-reconnect
+├── load_test.py       # concurrent load tester
+├── start.sh           # start all 3 KV nodes (local)
+└── start_chat.sh      # start all 3 Chat Servers (local)
 ```
 
 ---
@@ -211,8 +212,8 @@ Deployed the full stack across 3 AWS EC2 regions.
 
 ## Known Limitations / 已知局限
 
-- **Simple leader election** — based on lowest port number, not Raft/Paxos consensus / 选主基于端口号，非真正共识算法
+- **Simple leader election** (`node.py`) — based on lowest port number, not Raft/Paxos / 选主基于端口号，非真正共识算法
+- **No replication per shard** (`node_sharded.py`) — if a node dies, its keys are unavailable / 分片版无副本，节点挂了该分片不可用
 - **No conflict resolution** — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
-- **Single write leader** — KV write throughput limited by one leader; needs sharding / 单 Leader 写入瓶颈，需分片扩展
 
-Real solutions: Raft consensus algorithm, Redis Cluster sharding. / 真实解决方案：Raft 共识算法、Redis Cluster 分片。
+Real solutions: Raft consensus algorithm, Redis Cluster sharding with replicas. / 真实解决方案：Raft 共识算法、Redis Cluster 带副本的分片。
