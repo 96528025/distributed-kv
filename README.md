@@ -119,15 +119,16 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 
 ```
 distributed-kv/
-├── node.py            # KV node v1: replication + simple leader election (min port)
-├── node_sharded.py    # KV node v2: consistent hashing sharding (no single leader)
-├── node_raft.py       # KV node v3: Raft consensus (real leader election + log replication)
-├── client.py          # interactive CLI for the KV store
-├── chat_server.py     # WebSocket chat server backed by KV cluster
-├── chat_client.py     # chat client with auto-reconnect
-├── load_test.py       # concurrent load tester
-├── start.sh           # start all 3 KV nodes (local)
-└── start_chat.sh      # start all 3 Chat Servers (local)
+├── node.py               # KV node v1: replication + simple leader election (min port)
+├── node_sharded.py       # KV node v2: consistent hashing sharding (no single leader)
+├── node_raft.py          # KV node v3: Raft consensus (real leader election + log replication)
+├── node_replicated.py    # KV node v4: sharding + full replication (per-shard primary failover)
+├── client.py             # interactive CLI for the KV store
+├── chat_server.py        # WebSocket chat server backed by KV cluster
+├── chat_client.py        # chat client with auto-reconnect
+├── load_test.py          # concurrent load tester
+├── start.sh              # start all 3 KV nodes (local)
+└── start_chat.sh         # start all 3 Chat Servers (local)
 ```
 
 ---
@@ -248,11 +249,38 @@ Deployed the full stack across 3 AWS EC2 regions.
 
 ---
 
+### Day 4 — Sharding + Full Replication (`node_replicated.py`) / 第四天：分片 + 全量副本
+
+Best of both worlds: consistent hashing sharding (no single write bottleneck) + full replication (every node stores all data, reads from any node).
+
+结合分片和副本的优点：一致性哈希分片（无单点写瓶颈）+ 全量副本（每个节点存所有数据，可从任意节点读）。
+
+**Architecture / 架构：**
+- 3 shards, each shard has a primary; all nodes store all data / 3个分片，每个分片有primary，所有节点存全量数据
+- Writes go to the shard's primary, which replicates to all peers / 写入发给分片primary，primary同步给所有节点
+- Primary assignment: round-robin by shard index; auto-failover to next alive node / Primary按分片索引轮流分配，挂了自动切下一个存活节点
+- Background health check thread (every 2s) detects node failures and updates primary mapping / 后台健康检查线程（每2s）检测节点存活，自动更新primary
+
+```
+分片 0: primary=5001, 候补=[5002, 5003]
+分片 1: primary=5002, 候补=[5001, 5003]  ← 5002挂了 → 5003接管
+分片 2: primary=5003, 候补=[5001, 5002]
+```
+
+**Problems & Solutions / 遇到的问题：**
+
+| Problem / 问题 | Solution / 解决方法 |
+|---------------|-------------------|
+| Health check loop held `alive_lock` while making HTTP requests → deadlock with single-threaded HTTP server | Collect ping results outside the lock first, then update state under lock / 先在锁外ping，再加锁更新，避免持锁期间发HTTP请求导致死锁 |
+
+---
+
 ## Known Limitations / 已知局限
 
 - **Simple leader election** (`node.py`) — based on lowest port number, not consensus / 选主基于端口号，非真正共识算法
 - **No replication per shard** (`node_sharded.py`) — if a node dies, its keys are unavailable / 分片版无副本，节点挂了该分片不可用
 - **Raft without log compaction** (`node_raft.py`) — log grows unbounded; real systems use snapshots / Raft 没有日志压缩，真实系统需要快照
 - **No conflict resolution** (`node.py`) — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
+- **No Raft in replicated shards** (`node_replicated.py`) — primary elected by simple alive-check, not consensus; writes may be lost if primary crashes before replication / 分片primary选举无共识，primary宕机前未同步的写入会丢失
 
-Next steps: Raft log compaction, sharding with per-shard replication (like CockroachDB). / 下一步：Raft 日志压缩、每个分片有副本（类似 CockroachDB）。
+Next steps: Raft log compaction, combine Raft consensus with sharding + replication (like CockroachDB). / 下一步：Raft 日志压缩、将 Raft 共识与分片副本结合（类似 CockroachDB）。
