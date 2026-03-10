@@ -411,6 +411,30 @@ curl "http://localhost:5001/get?key=bob"     # → 40
 | POST | `/txn_abort` | 中止事务，释放锁（分片 Leader）/ Abort, release locks (shard leader) |
 | POST | `/install_snapshot` | Follower 向 Leader 拉取快照 / Follower fetches snapshot from leader |
 
+**Automated Tests / 自动化测试：**
+
+```bash
+python3 test_raft_sharded.py   # 31 个测试用例，全自动，约 30s 跑完
+```
+
+覆盖：基础读写、Leader 转发、快照压缩、节点重启恢复、事务提交、锁冲突、锁超时自动释放。
+
+**Problems & Solutions / 遇到的问题：**
+
+| Problem / 问题 | Root Cause / 根本原因 | Solution / 解决方法 |
+|---------------|----------------------|-------------------|
+| 所有事务测试失败，报 `unreachable` | `HTTPServer` 默认单线程：协调者向自身发 `/txn_prepare` 时，外层请求占着唯一线程，内层请求永远排不上队 → 超时 | 改用 `ThreadingMixIn + HTTPServer`，每个请求在独立线程处理 |
+| 写 25 条 key 没有触发快照 | 25 条 key 经哈希分散到 3 个分片，每片只有 ~8 条，低于 `SNAPSHOT_THRESHOLD=20` | 写 60 条才让每片超过阈值；测试设计时要考虑数据分布 |
+
+**Key Insight / 核心收获：**
+
+自动化测试不只是"省事"——它能发现手动 `curl` 永远触发不了的场景。
+HTTPServer 单线程死锁这个 bug，手动测试时协调者和 Leader 总在不同节点，永远不会自己调自己，根本发现不了。
+是自动化测试（固定用 5001 当协调者，而 5001 也可能是 Leader）第一次真实复现了这个问题。
+
+Automated tests don't just save time — they surface bugs that manual `curl` can never trigger.
+The single-threaded HTTPServer deadlock only manifests when the coordinator and the shard leader happen to be the same node. Manual testing never hit this because curl requests naturally go to different nodes. The automated test suite exposed it on the first run.
+
 ---
 
 ## Known Limitations / 已知局限
