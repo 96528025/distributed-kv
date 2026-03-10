@@ -270,21 +270,24 @@ def _become_leader_locked(shard):
 def send_heartbeats(shard):
     """Leader 发心跳给所有 Follower（在 shard.lock 外调用）"""
     with shard.lock:
-        term    = shard.term
-        ci      = shard.commit_index
-        entries = list(shard.log)
-        lo      = shard.log_offset
-        sid     = shard.shard_id
+        term      = shard.term
+        ci        = shard.commit_index
+        entries   = list(shard.log)
+        lo        = shard.log_offset
+        snap_term = shard.snapshot_term   # 与 log_offset 同一锁块读，保证一致
+        sid       = shard.shard_id
 
     for port in PEER_PORTS:
-        def hb(p, t, e, c, offset):
+        def hb(p, t, e, c, offset, pt):
             result = send_rpc(p, "/append_entries", {
-                "shard_id":     sid,
-                "term":         t,
-                "leader_id":    MY_PORT,
-                "entries":      e,
-                "commit_index": c,
-                "log_offset":   offset,
+                "shard_id":       sid,
+                "term":           t,
+                "leader_id":      MY_PORT,
+                "entries":        e,
+                "commit_index":   c,
+                "log_offset":     offset,
+                "prev_log_index": offset - 1,   # 当前日志窗口之前的最后一条绝对 index
+                "prev_log_term":  pt,            # 该条目的 term（来自快照）
             })
             if result and result.get("term", 0) > t:
                 with shard.lock:
@@ -292,7 +295,7 @@ def send_heartbeats(shard):
                         shard.term = result["term"]
                         shard.role = FOLLOWER
 
-        threading.Thread(target=hb, args=(port, term, entries, ci, lo), daemon=True).start()
+        threading.Thread(target=hb, args=(port, term, entries, ci, lo, snap_term), daemon=True).start()
 
 
 def heartbeat_loop():
@@ -430,17 +433,20 @@ class Handler(BaseHTTPRequestHandler):
 
         def replicate_to(port):
             with shard.lock:
-                rep_term    = shard.term
-                rep_entries = list(shard.log)
-                rep_ci      = shard.commit_index
-                rep_lo      = shard.log_offset
+                rep_term      = shard.term
+                rep_entries   = list(shard.log)
+                rep_ci        = shard.commit_index
+                rep_lo        = shard.log_offset
+                rep_snap_term = shard.snapshot_term   # 与 rep_lo 同一锁块读
             result = send_rpc(port, "/append_entries", {
-                "shard_id":     sid,
-                "term":         rep_term,
-                "leader_id":    MY_PORT,
-                "entries":      rep_entries,
-                "commit_index": rep_ci,
-                "log_offset":   rep_lo,
+                "shard_id":       sid,
+                "term":           rep_term,
+                "leader_id":      MY_PORT,
+                "entries":        rep_entries,
+                "commit_index":   rep_ci,
+                "log_offset":     rep_lo,
+                "prev_log_index": rep_lo - 1,
+                "prev_log_term":  rep_snap_term,
             })
             if result and result.get("success"):
                 with ack_lock:
@@ -583,6 +589,8 @@ class Handler(BaseHTTPRequestHandler):
         to_apply      = []
         need_snapshot = False
         snap_leader   = None
+        prev_log_index = body.get("prev_log_index", -1)
+        prev_log_term  = body.get("prev_log_term", 0)
 
         with shard.lock:
             if term < shard.term:
@@ -596,6 +604,24 @@ class Handler(BaseHTTPRequestHandler):
 
             shard.role      = FOLLOWER
             shard.leader_id = lid
+
+            # ── prevLogIndex 一致性检查 ─────────────────────────
+            # 在接受新条目前，验证"接入点"处的日志是否吻合
+            if entries and prev_log_index >= 0:
+                if prev_log_index >= shard.log_offset:
+                    # prev entry 在当前日志窗口内
+                    rel_i = prev_log_index - shard.log_offset
+                    if rel_i < len(shard.log):
+                        if shard.log[rel_i]["term"] != prev_log_term:
+                            # 冲突：该位置 term 不一致，截断到冲突点并拒绝
+                            shard.log = shard.log[:rel_i]
+                            print(f"  ⚠️  分片{sid}: prevLog 冲突（index={prev_log_index}），"
+                                  f"截断至 rel_i={rel_i}")
+                            self._respond(200, {"term": shard.term, "success": False,
+                                               "conflict_index": prev_log_index})
+                            return
+                    # else: prev entry 超出当前日志，由下方 need_snapshot 逻辑处理
+                # prev_log_index < log_offset：在快照范围内，信任快照 term 一致，跳过
 
             # 同步日志
             if entries:
@@ -650,6 +676,8 @@ class Handler(BaseHTTPRequestHandler):
                 for entry in to_apply:
                     apply_entry(entry)
                 save_to_disk()
+            # Follower 也触发快照检查（日志超阈值时生成快照文件，重启不依赖磁盘文件）
+            threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
 
         self._respond(200, {"term": resp_term, "success": True})
 
