@@ -147,6 +147,7 @@ distributed-kv/
 | GET | `/isolate` | enter isolated mode (split-brain demo) / 进入孤立模式 |
 | GET | `/heal` | exit isolated mode / 退出孤立模式 |
 | POST | `/set` | write a string value / 写入字符串 |
+| POST | `/delete` | delete a key / 删除 key |
 | POST | `/lpush` | append to a list / 列表追加 |
 | POST | `/internal` | receive replicated data from peers / 接收同步数据 |
 
@@ -414,10 +415,10 @@ curl "http://localhost:5001/get?key=bob"     # → 40
 **Automated Tests / 自动化测试：**
 
 ```bash
-python3 test_raft_sharded.py   # 31 个测试用例，全自动，约 30s 跑完
+python3 test_raft_sharded.py   # 50 个测试用例，全自动，约 30s 跑完
 ```
 
-覆盖：基础读写、Leader 转发、快照压缩、节点重启恢复、事务提交、锁冲突、锁超时自动释放。
+覆盖：基础读写、Leader 转发、快照压缩、节点重启恢复、事务提交、锁冲突、锁超时自动释放、/delete 端点、线性化读。
 
 **Problems & Solutions / 遇到的问题：**
 
@@ -434,6 +435,74 @@ HTTPServer 单线程死锁这个 bug，手动测试时协调者和 Leader 总在
 
 Automated tests don't just save time — they surface bugs that manual `curl` can never trigger.
 The single-threaded HTTPServer deadlock only manifests when the coordinator and the shard leader happen to be the same node. Manual testing never hit this because curl requests naturally go to different nodes. The automated test suite exposed it on the first run.
+
+---
+
+### Day 5c — Delete + Linearizable Reads + Raft Correctness / 第五天 c：删除 + 线性化读 + Raft 正确性
+
+Four improvements added to `node_raft_sharded.py`, bringing total automated tests to 50.
+
+在 `node_raft_sharded.py` 上继续加四个改进，自动化测试增至 50 个。
+
+**Feature 1: `/delete` Endpoint / 删除端点**
+
+Deletes a key via Raft consensus — the delete operation goes through the same log-replication path as writes, so it's atomic and consistent across all replicas.
+
+删除操作走 Raft 日志复制，与写入完全相同的路径，保证原子性和多节点一致性。
+
+- Idempotent — deleting a nonexistent key returns `{"status": "ok"}` / 幂等，删不存在的 key 也返回 ok
+- Non-leader auto-forwards with `forwarded_by` field / 非 Leader 自动转发，响应包含 `forwarded_by`
+- `apply_entry(entry)` handles both `op="set"` and `op="delete"` / 统一 apply 函数处理两种操作
+
+**Feature 2: Linearizable Reads / 线性化读**
+
+Previously any node could serve reads from local state — a follower that was slightly behind could return stale data. Now `/get` routes to the shard Leader, which always has the latest committed state.
+
+之前任意节点都从本地状态读，Follower 落后时会返回旧值。现在 `/get` 路由到分片 Leader，保证读到最新已提交的数据。
+
+- Leader serves directly from local store / Leader 直接从本地读
+- Non-leader forwards via HTTP and adds `forwarded_by` to the response / 非 Leader 转发，响应含 `forwarded_by`
+- Write then immediately read from any node → always returns the latest value / 写完立刻从任意节点读都能拿到最新值
+
+**Feature 3: prevLogIndex / prevLogTerm Consistency Check / 日志一致性检查**
+
+Implements the standard Raft AppendEntries consistency check: before accepting new entries, a follower verifies that the entry just before them matches the leader's expectation. If there's a term conflict, the follower truncates its log and rejects the RPC, forcing the leader to retry from an earlier point.
+
+实现标准 Raft AppendEntries 一致性检查：Follower 在接受新日志前，先验证前一条日志的 term 是否与 Leader 一致。冲突时截断日志并拒绝，Leader 会从更早的位置重试。
+
+- `snapshot_term` is read in the same `shard.lock` block as `log_offset` to prevent race conditions / `snapshot_term` 与 `log_offset` 在同一把锁内读取，防止 race condition
+
+**Feature 4: Follower Snapshots / Follower 自动快照**
+
+Previously only Leaders created snapshot files. Now Followers also call `maybe_snapshot()` after applying committed entries, so every node eventually compacts its own log independently.
+
+之前只有 Leader 生成快照文件。现在 Follower 也在 apply 日志后触发快照，每个节点都能独立压缩自己的日志。
+
+- Confirmed: writing 60 keys now generates 6 snapshot files (3 nodes × shards), vs 2 before / 验证：写60条后生成6个快照文件（3节点×分片），之前只有2个
+
+**New API Endpoints / 新增 API 接口：**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/delete` | 删除 key（Raft 写入，支持非 Leader 转发）/ Delete a key via Raft (auto-forwarded if non-leader) |
+
+**Verification / 验证：**
+```bash
+python3 test_raft_sharded.py   # 50 个测试用例，全自动
+
+# 或手动验证：
+curl -X POST http://localhost:5001/set -d '{"key":"x","value":"hello"}'
+curl -X POST http://localhost:5001/delete -d '{"key":"x"}'
+curl "http://localhost:5001/get?key=x"         # → error: key not found
+curl "http://localhost:5002/get?key=linear_key" # → forwarded_by: 5001 (if 5002 is not leader)
+```
+
+**Problems & Solutions / 遇到的问题：**
+
+| Problem / 问题 | Root Cause / 根本原因 | Solution / 解决方法 |
+|---------------|----------------------|-------------------|
+| prevLogIndex check must read `snapshot_term` atomically with `log_offset` | If snapshot runs between two separate lock acquisitions, `log_offset` and `snapshot_term` can be from different snapshots | Read both fields in the same `with shard.lock:` block / 在同一个锁块内一起读取 |
+| In "full overwrite" mode, prevLogIndex check mostly falls into "in snapshot" branch | `prev_log_index = log_offset - 1 < shard.log_offset` is always true when Leader sends full log | Still valuable as defensive programming — catches real term conflicts in partial-update scenarios / 作为防御性编程保留，能捕获部分更新场景下的真实 term 冲突 |
 
 ---
 
