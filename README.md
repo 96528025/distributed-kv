@@ -144,20 +144,34 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 
 ## Project Structure / 项目结构
 
-```
-distributed-kv/
-├── node.py                  # KV node v1: replication + simple leader election (min port)
-├── node_sharded.py          # KV node v2: consistent hashing sharding (no single leader)
-├── node_raft.py             # KV node v3: Raft consensus (real leader election + log replication)
-├── node_replicated.py       # KV node v4: sharding + full replication (per-shard primary failover)
-├── node_raft_sharded.py     # KV node v5: per-shard Raft groups (CockroachDB/TiKV architecture)
-├── client.py                # interactive CLI for the KV store
-├── chat_server.py           # WebSocket chat server backed by KV cluster
-├── chat_client.py           # chat client with auto-reconnect
-├── load_test.py             # concurrent load tester
-├── start.sh                 # start all 3 KV nodes (local)
-└── start_chat.sh            # start all 3 Chat Servers (local)
-```
+### KV Node Versions / KV 节点版本演进
+
+五个版本按顺序构建，每个版本解决上一个的核心缺陷：
+
+| File / 文件 | Version | What it does / 功能 |
+|-------------|---------|---------------------|
+| `node.py` | v1 | 最简单版本。Leader = 存活节点中端口最小的（非共识）。写入只有 Leader 接受，同步给其他节点。支持字符串和列表类型，有脑裂演示（/isolate /heal）。**聊天系统用的是这个** |
+| `node_sharded.py` | v2 | 加入一致性哈希分片：`MD5(key) % 3` 决定哪个节点负责哪个 key，每个节点都是自己 key 的 "owner"，写入可以并行。缺陷：节点挂了，它负责的那部分 key 就读不了 |
+| `node_raft.py` | v3 | 实现真正的 Raft 共识算法（随机超时选举 + 日志复制 + 心跳 + 任期）。但只有一个全局 Raft group，没有分片，写入还是单点瓶颈 |
+| `node_replicated.py` | v4 | 分片 + 全量副本：每个分片有 primary，所有节点存全量数据，读任意节点都行。缺陷：primary 选举靠简单存活检查，不是 Raft，宕机前未同步的写入会丢 |
+| `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group（CockroachDB / TiKV 的核心架构）。含：日志快照压缩、两阶段提交（2PC）事务、线性化读、批量写入、/delete。当前最完整的版本 |
+
+### Chat System / 聊天系统
+
+| File / 文件 | What it does / 功能 |
+|-------------|---------------------|
+| `chat_server.py` | WebSocket 聊天服务器。无状态，所有消息通过 `/lpush` 存到 v1 KV；新用户连接时用 `/lrange` 拉取最近 50 条历史。多台并行运行，任一台挂了不影响其他 |
+| `chat_client.py` | 聊天客户端。两个并发 async task（收/发）确保断线立刻检测到，自动重连其他 Chat Server |
+| `load_test.py` | 压力测试脚本。模拟最多 1000 个并发用户同时发消息，统计成功率 / 吞吐量 / 平均延迟 |
+
+### Tools & Scripts / 工具与脚本
+
+| File / 文件 | What it does / 功能 |
+|-------------|---------------------|
+| `client.py` | 交互式命令行客户端，手动操作 v1 KV store（get / set / lpush / lrange 等） |
+| `test_raft_sharded.py` | v5 的全自动测试套件（56 个用例，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、线性化读、批量写入 |
+| `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
+| `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
 ---
 
