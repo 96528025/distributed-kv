@@ -374,6 +374,92 @@ check("bob 值已更新为 after_timeout",
       f"value={r_bob.get('value') if r_bob else 'None'}")
 
 
+# ── 8. /delete 端点 ────────────────────────────────────────
+section("8. /delete 端点")
+
+# 先写一个 key，再删除
+r = http_post(PORTS[0], "/set", {"key": "to_delete", "value": "bye"})
+check("delete 前先写入 to_delete", r and r.get("status") == "ok")
+time.sleep(0.3)
+
+r = http_post(PORTS[0], "/delete", {"key": "to_delete"})
+check("DELETE to_delete 返回 ok",
+      r and r.get("status") == "ok" and r.get("deleted") is True, str(r))
+time.sleep(0.5)
+
+# 删除后三个节点都读不到
+for port in PORTS:
+    r = http_get(port, "/get?key=to_delete")
+    check(f"节点 {port} 读不到已删除的 key",
+          r is None or r.get("error") is not None or "value" not in r,
+          str(r))
+
+# 删除不存在的 key 也应该正常返回 ok（幂等）
+r = http_post(PORTS[0], "/delete", {"key": "nonexistent_xyz"})
+check("删除不存在的 key 幂等返回 ok", r and r.get("status") == "ok")
+
+# 删除后重新写入同一个 key
+r = http_post(PORTS[0], "/set", {"key": "to_delete", "value": "reborn"})
+check("删除后可以重新写入同一个 key", r and r.get("status") == "ok")
+time.sleep(0.3)
+r = http_get(PORTS[0], "/get?key=to_delete")
+check("重新写入后可以读到新值", r and r.get("value") == "reborn")
+
+# 向非 Leader 发 delete，验证转发
+import hashlib
+sid_del = int(hashlib.md5("to_delete".encode()).hexdigest(), 16) % len(PORTS)
+h = http_get(PORTS[0], "/health")
+leader_del = h["shards"][str(sid_del)]["leader"]
+non_leader_del = next((p for p in PORTS if p != leader_del), None)
+if non_leader_del:
+    r = http_post(non_leader_del, "/delete", {"key": "to_delete"})
+    check(f"向非 Leader {non_leader_del} 发 delete 自动转发",
+          r and r.get("status") == "ok" and "forwarded_by" in r, str(r))
+
+
+# ── 9. 线性化读（读路由到 Leader）─────────────────────────
+section("9. 线性化读（/get 路由到 Leader）")
+
+# 写入一个 key
+r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v1"})
+check("写入 linear_key=v1", r and r.get("status") == "ok")
+time.sleep(0.3)
+
+# 从三个节点读，结果都是 v1（非 Leader 会被转发到 Leader）
+for port in PORTS:
+    r = http_get(port, "/get?key=linear_key")
+    check(f"节点 {port} 读 linear_key = v1（线性化）",
+          r and r.get("value") == "v1",
+          f"value={r.get('value') if r else 'None'}, forwarded_by={r.get('forwarded_by') if r else '-'}")
+
+# 验证非 Leader 节点的读响应包含 forwarded_by
+import hashlib
+sid_lk = int(hashlib.md5("linear_key".encode()).hexdigest(), 16) % len(PORTS)
+h = http_get(PORTS[0], "/health")
+leader_lk = h["shards"][str(sid_lk)]["leader"]
+non_leaders = [p for p in PORTS if p != leader_lk]
+if non_leaders:
+    r = http_get(non_leaders[0], "/get?key=linear_key")
+    check(f"非 Leader {non_leaders[0]} 读取包含 forwarded_by 字段",
+          r and "forwarded_by" in r,
+          str(r))
+
+# Leader 直接读，不含 forwarded_by
+r = http_get(leader_lk, "/get?key=linear_key")
+check(f"Leader {leader_lk} 直接读，不含 forwarded_by",
+      r and "forwarded_by" not in r,
+      str(r))
+
+# 写入 → 立即从任意节点读，保证读到最新值（线性化保证）
+r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v2"})
+check("更新 linear_key=v2", r and r.get("status") == "ok")
+for port in PORTS:
+    r = http_get(port, "/get?key=linear_key")
+    check(f"节点 {port} 立即读到最新值 v2",
+          r and r.get("value") == "v2",
+          f"value={r.get('value') if r else 'None'}")
+
+
 # ══════════════════════════════════════════════════════════
 #  汇总结果
 # ══════════════════════════════════════════════════════════

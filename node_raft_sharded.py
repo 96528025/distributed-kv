@@ -7,9 +7,11 @@
 - 所有节点存全量数据（全量副本）
 - 多个分片的 Leader 可以在不同节点上，写入并行不冲突
 
-新增功能（Day 5）：
+新增功能：
   1. 日志快照压缩：日志超过 SNAPSHOT_THRESHOLD 条时自动生成快照，截断旧日志
   2. 多 key 事务（2PC）：原子地修改多个 key，使用两阶段提交保证一致性
+  3. 删除操作（/delete）：通过 Raft 共识删除 key，所有节点同步
+  4. 线性化读（/get 路由到 Leader）：读请求转发给分片 Leader，保证读到最新已提交数据
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -56,8 +58,23 @@ def send_rpc(port, path, data, timeout=0.5):
     except Exception:
         return None
 
+def send_get_rpc(port, path, timeout=0.5):
+    """发送 HTTP GET RPC，失败返回 None（不抛异常）"""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
 def majority():
     return len(ALL_PORTS) // 2 + 1
+
+def apply_entry(entry):
+    """将一条日志条目应用到 store（调用前必须持有 store_lock）"""
+    if entry.get("op") == "delete":
+        store.pop(entry["key"], None)
+    else:
+        store[entry["key"]] = entry["value"]
 
 
 # ── 每个分片的 Raft 状态 ───────────────────────────────────
@@ -310,21 +327,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/get"):
-            key = self.path.split("=")[-1]
+            key   = self.path.split("=")[-1]
+            sid   = get_shard(key)
+            shard = shards[sid]
+
+            with shard.lock:
+                role   = shard.role
+                leader = shard.leader_id
+
+            # 非 Leader → 转发给 Leader（线性化读，保证读到最新提交）
+            if role != LEADER:
+                if leader is not None:
+                    result = send_get_rpc(leader, f"/get?key={key}")
+                    if result is not None:
+                        result["forwarded_by"] = MY_PORT
+                        self._respond(200 if "value" in result else 404, result)
+                    else:
+                        self._respond(503, {"error": "leader unreachable", "shard": sid})
+                else:
+                    self._respond(503, {"error": "no leader yet for shard", "shard": sid})
+                return
+
+            # 是 Leader → 直接读（保证看到所有已提交数据）
             with store_lock:
                 value = store.get(key)
             if value is None:
                 self._respond(404, {"error": f"key '{key}' not found"})
             else:
-                sid = get_shard(key)
-                with shards[sid].lock:
-                    leader = shards[sid].leader_id
                 self._respond(200, {
                     "key":          key,
                     "value":        value,
                     "from_node":    MY_PORT,
                     "shard":        sid,
-                    "shard_leader": leader,
+                    "shard_leader": MY_PORT,
                 })
 
         elif self.path == "/all":
@@ -355,6 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         body   = json.loads(self.rfile.read(length))
 
         if   self.path == "/set":               self._handle_set(body)
+        elif self.path == "/delete":            self._handle_delete(body)
         elif self.path == "/vote":              self._handle_vote(body)
         elif self.path == "/append_entries":    self._handle_append_entries(body)
         elif self.path == "/install_snapshot":  self._handle_install_snapshot(body)
@@ -365,10 +401,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, {"error": "unknown endpoint"})
 
-    # ── 核心 Raft 写入（Leader 调用）─────────────────────────
-    def _do_raft_write(self, shard, key, value):
+    # ── 核心 Raft 操作（Leader 调用）─────────────────────────
+    def _do_raft_op(self, shard, key, value=None, op="set"):
         """
-        在当前节点（必须是 shard 的 Leader）执行一次 Raft 写入。
+        在当前节点（必须是 shard 的 Leader）执行一次 Raft 操作。
+        op="set"    → 写入 key=value
+        op="delete" → 删除 key
         返回 (True, None) 成功，或 (False, error_msg) 失败。
         调用前无需持任何锁。
         """
@@ -377,11 +415,14 @@ class Handler(BaseHTTPRequestHandler):
             if shard.role != LEADER:
                 return False, "not leader"
             t     = shard.term
-            entry = {"term": t, "key": key, "value": value}
+            entry = {"term": t, "op": op, "key": key}
+            if op == "set":
+                entry["value"] = value
             shard.log.append(entry)
             log_index = len(shard.log) - 1 + shard.log_offset   # 绝对 index
 
-        print(f"\n📝 [分片{sid} Leader] 写入日志[{log_index}]: {key} = {value}")
+        label = f"{key} = {value}" if op == "set" else f"DELETE {key}"
+        print(f"\n📝 [分片{sid} Leader] 写入日志[{log_index}]: {label}")
 
         acks      = [MY_PORT]
         ack_lock  = threading.Lock()
@@ -421,9 +462,9 @@ class Handler(BaseHTTPRequestHandler):
             with shard.lock:
                 shard.commit_index = log_index
             with store_lock:
-                store[key] = value
+                apply_entry(entry)
                 save_to_disk()
-            print(f"  🎉 分片{sid} 已提交：{key} = {value}")
+            print(f"  🎉 分片{sid} 已提交：{label}")
             # 异步触发快照（不阻塞当前请求）
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
             return True, None
@@ -453,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
             return
 
-        success, err = self._do_raft_write(shard, key, value)
+        success, err = self._do_raft_op(shard, key, value)
         if success:
             with shard.lock:
                 t = shard.term
@@ -461,6 +502,43 @@ class Handler(BaseHTTPRequestHandler):
                 "status":     "ok",
                 "key":        key,
                 "value":      value,
+                "shard":      sid,
+                "written_to": MY_PORT,
+                "term":       t,
+            })
+        else:
+            self._respond(500, {"error": err, "shard": sid})
+
+    def _handle_delete(self, body):
+        key   = body.get("key")
+        sid   = get_shard(key)
+        shard = shards[sid]
+
+        with shard.lock:
+            r = shard.role
+            l = shard.leader_id
+
+        if r != LEADER:
+            if l is not None:
+                print(f"\n↪️  分片{sid} 的 Leader 是 {l}，转发删除...")
+                result = send_rpc(l, "/delete", {"key": key})
+                if result:
+                    result["forwarded_by"] = MY_PORT
+                    self._respond(200, result)
+                else:
+                    self._respond(503, {"error": "leader unreachable", "shard": sid})
+            else:
+                self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
+            return
+
+        success, err = self._do_raft_op(shard, key, op="delete")
+        if success:
+            with shard.lock:
+                t = shard.term
+            self._respond(200, {
+                "status":     "ok",
+                "key":        key,
+                "deleted":    True,
                 "shard":      sid,
                 "written_to": MY_PORT,
                 "term":       t,
@@ -570,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
         elif to_apply:
             with store_lock:
                 for entry in to_apply:
-                    store[entry["key"]] = entry["value"]
+                    apply_entry(entry)
                 save_to_disk()
 
         self._respond(200, {"term": resp_term, "success": True})
@@ -736,7 +814,7 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"  ✅ 分片{sid}: 事务 {txn_id} COMMIT（{len(ops)} 条写入）")
         for op in ops:
-            success, err = self._do_raft_write(shard, op["key"], op["value"])
+            success, err = self._do_raft_op(shard, op["key"], op.get("value"), op.get("op", "set"))
             if not success:
                 self._respond(500, {"status": "commit_failed", "error": err, "key": op["key"]})
                 return
