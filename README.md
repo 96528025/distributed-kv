@@ -8,6 +8,8 @@ A Redis-inspired distributed key-value store built from scratch in Python, exten
 
 ## Architecture / 架构
 
+### Chat System (v1 KV + chat servers) / 聊天系统架构
+
 ```
 [You / 你]
     │  WebSocket
@@ -32,19 +34,33 @@ A Redis-inspired distributed key-value store built from scratch in Python, exten
 - **KV Cluster** stores all message history — persisted to disk, replicated across 3 continents
 - Write to Virginia → automatically synced to Oregon and Ireland
 
+### Latest KV Architecture (v5: node_raft_sharded.py) / 最新 KV 架构
+
+```
+每个分片独立运行一个 Raft 共识组，三个分片可能有三个不同的 Leader：
+
+分片 0: Raft Group → Leader 可能在 5001 / 5002 / 5003 任意节点
+分片 1: Raft Group → Leader 可能在不同节点
+分片 2: Raft Group → Leader 可能在不同节点
+
+所有节点存全量数据，写入路由到对应分片的 Leader，读取路由到 Leader（线性化读）
+```
+
 ---
 
 ## Features / 功能
 
 **Distributed KV Store**
 - Data replication — write to any node, all nodes sync automatically / 写入一个节点，所有节点自动同步
-- Disk persistence — every write saved to `data_<port>.json` / 每次写入同时存磁盘，重启不丢数据
+- Disk persistence — every write saved to disk / 每次写入同时存磁盘，重启不丢数据
 - Fault tolerance — cluster keeps working when a node goes down / 节点挂掉，集群继续工作
-- Snapshot recovery — restarted nodes fetch full data from peers / 节点重启从其他节点拉取全量数据
-- Leader election — lowest-port alive node becomes leader / 存活节点中端口最小的当 Leader
-- Auto redirect — follower automatically redirects writes to leader / Follower 自动转发写入到 Leader
-- List type — `lpush` / `lrange` for storing message history / 列表类型，用于存储聊天历史
-- Split-brain demo — simulate network partition with `isolate`/`heal` / 脑裂演示
+- Log snapshot compaction (v5) — log truncated after threshold; restart restores from local snapshot file / 日志超过阈值自动压缩，重启从本地快照恢复
+- Raft consensus leader election (v5) / simple min-port election (v1) / Raft 共识选主（v5）/最小端口当 Leader（v1）
+- Auto redirect — non-leader automatically forwards writes/reads to shard leader / 非 Leader 自动转发请求到分片 Leader
+- Multi-key transactions via 2PC (v5) — atomically write across shards / 跨分片原子事务（v5）
+- Batch writes (v5) — concurrent requests merged into one Raft round / 批量写入，并发请求合并（v5）
+- List type — `lpush` / `lrange` for storing message history (v1/v2) / 列表类型，用于存储聊天历史（v1/v2）
+- Split-brain demo — simulate network partition with `isolate`/`heal` (v1) / 脑裂演示（v1）
 
 **Distributed Chat**
 - Multi-server — 3 Chat Servers across 3 regions, clients auto-reconnect on failure / 三大洲三台服务器，断线自动重连
@@ -66,6 +82,9 @@ A Redis-inspired distributed key-value store built from scratch in Python, exten
 
 瓶颈在每台 Chat Server 的连接数（约 80 并发），而非延迟。水平扩展有效：加一台服务器，容量线性增加。KV 写入瓶颈在单 Leader，需分片突破。
 
+> ⚠️ 以上压测数据基于 v1 KV（`node.py`）+ 聊天服务器，不代表 v5（`node_raft_sharded.py`）的性能。v5 加入了 Raft 共识和批量写入，吞吐量特性不同。
+> These results are for the v1 KV + chat system, not v5.
+
 ---
 
 ## How to Run / 如何运行
@@ -73,11 +92,10 @@ A Redis-inspired distributed key-value store built from scratch in Python, exten
 ### Local / 本地运行
 
 ```bash
-# Terminal 1: start KV cluster / 启动 KV 集群
+# Terminal 1: start KV cluster (v1) / 启动 KV 集群
 bash start.sh
 
 # Terminal 2: start Chat Servers / 启动聊天服务器
-source ~/Desktop/chat-room/venv/bin/activate
 python3 chat_server.py 9001 &
 python3 chat_server.py 9002 &
 python3 chat_server.py 9003 &
@@ -87,6 +105,15 @@ python3 chat_client.py
 
 # Load test / 压力测试
 python3 load_test.py
+
+# ── 或运行最新 v5 KV 集群 ──
+python3 node_raft_sharded.py 5001 5002 5003 &
+python3 node_raft_sharded.py 5002 5001 5003 &
+python3 node_raft_sharded.py 5003 5001 5002 &
+sleep 5
+
+# 运行自动化测试 / Run automated tests
+python3 test_raft_sharded.py
 ```
 
 ### Cloud (AWS) / 云端运行
@@ -136,18 +163,36 @@ distributed-kv/
 
 ## API Endpoints / API 接口
 
+### v5: node_raft_sharded.py（最新版）
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/get?key=<k>` | read a value / 读取字符串值 |
+| GET | `/get?key=<k>` | read a value — routes to shard leader (linearizable) / 线性化读，路由到分片 Leader |
+| GET | `/all` | dump all data / 查看所有数据 |
+| GET | `/health` | per-shard Raft state (role, term, leader, log_length...) / 各分片 Raft 状态 |
+| POST | `/set` | write a key-value pair (batched, Raft-replicated) / 写入（批量合并，Raft 复制） |
+| POST | `/delete` | delete a key (Raft-replicated) / 删除 key（Raft 复制） |
+| POST | `/txn` | multi-key atomic transaction — 2PC coordinator / 多 key 原子事务（协调者） |
+| POST | `/txn_prepare` | lock keys and stage intent — shard leader internal / 锁定 key，暂存意图（内部） |
+| POST | `/txn_commit` | commit transaction via Raft — shard leader internal / 通过 Raft 提交事务（内部） |
+| POST | `/txn_abort` | abort transaction, release locks — internal / 中止事务，释放锁（内部） |
+| POST | `/install_snapshot` | follower requests full snapshot from leader — internal / Follower 向 Leader 拉取快照（内部） |
+| POST | `/append_entries` | Raft log replication RPC — internal / Raft 日志复制（内部） |
+| POST | `/vote` | Raft vote request RPC — internal / Raft 投票（内部） |
+
+### v1: node.py + chat system（早期版 / 聊天系统）
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/get?key=<k>` | read a string value / 读取字符串值 |
 | GET | `/lrange?key=<k>&start=0&end=49` | read a list range / 读取列表片段 |
 | GET | `/all` | dump all data / 查看所有数据 |
 | GET | `/health` | health check / 健康检查 |
-| GET | `/snapshot` | full data dump for recovery / 全量快照（用于恢复） |
+| GET | `/snapshot` | full data dump for peer recovery / 全量快照（供 peer 拉取恢复） |
 | GET | `/leader` | current leader info / 查看当前 Leader |
 | GET | `/isolate` | enter isolated mode (split-brain demo) / 进入孤立模式 |
 | GET | `/heal` | exit isolated mode / 退出孤立模式 |
 | POST | `/set` | write a string value / 写入字符串 |
-| POST | `/delete` | delete a key / 删除 key |
 | POST | `/lpush` | append to a list / 列表追加 |
 | POST | `/internal` | receive replicated data from peers / 接收同步数据 |
 
@@ -381,11 +426,12 @@ Atomically write multiple keys across different shards — all succeed or all fa
 **Verification / 验证：**
 ```bash
 # ── 快照压缩 ──
-for i in {1..25}; do
+# 注意：需要写 60 条，因为 25 条经哈希分散到 3 个分片后每片只有 ~8 条，低于阈值 20
+for i in {1..60}; do
   curl -s -X POST http://localhost:5001/set \
     -H "Content-Type: application/json" -d "{\"key\":\"k$i\",\"value\":\"v$i\"}"
 done
-ls snapshot_*   # 快照文件已生成
+ls snapshot_*   # 快照文件已生成（每个节点每个分片各一个，共 6 个）
 
 pkill -f "node_raft_sharded.py 5002"; sleep 2
 python3 node_raft_sharded.py 5002 5001 5003 &
@@ -415,10 +461,10 @@ curl "http://localhost:5001/get?key=bob"     # → 40
 **Automated Tests / 自动化测试：**
 
 ```bash
-python3 test_raft_sharded.py   # 50 个测试用例，全自动，约 30s 跑完
+python3 test_raft_sharded.py   # 31 个测试用例（Day 5b 时），全自动，约 30s 跑完
 ```
 
-覆盖：基础读写、Leader 转发、快照压缩、节点重启恢复、事务提交、锁冲突、锁超时自动释放、/delete 端点、线性化读。
+覆盖：基础读写、Leader 转发、快照压缩、节点重启恢复、事务提交、锁冲突、锁超时自动释放。
 
 **Problems & Solutions / 遇到的问题：**
 
@@ -488,7 +534,7 @@ Previously only Leaders created snapshot files. Now Followers also call `maybe_s
 
 **Verification / 验证：**
 ```bash
-python3 test_raft_sharded.py   # 50 个测试用例，全自动
+python3 test_raft_sharded.py   # 56 个测试用例（最新），全自动
 
 # 或手动验证：
 curl -X POST http://localhost:5001/set -d '{"key":"x","value":"hello"}'
