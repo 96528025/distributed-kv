@@ -1,8 +1,14 @@
-# Distributed KV Store + Real-Time Chat / 分布式键值存储 + 实时聊天室
+# Distributed KV Store / 分布式键值存储引擎
 
-A Redis-inspired distributed key-value store built from scratch in Python, extended into a full distributed chat system deployed across 3 AWS regions. Demonstrates core distributed systems concepts: data replication, fault tolerance, disk persistence, snapshot recovery, leader election, split-brain, horizontal scaling, consistent hashing sharding, and cloud deployment.
+A distributed key-value store built from scratch in Python — evolving from a simple 3-node replicated store all the way to per-shard Raft consensus groups, the architecture used by CockroachDB and TiKV. Deployed across 3 AWS regions.
 
-用 Python 从零手写的分布式键值数据库，升级为完整的分布式聊天系统，部署在 AWS 三大洲。演示了分布式系统核心概念：数据复制、持久化、故障容忍、快照恢复、选主、脑裂、水平扩展、一致性哈希分片和云端部署。
+Demonstrates core distributed systems concepts: Raft consensus, leader election, log replication, log snapshot compaction, consistent hashing sharding, linearizable reads, two-phase commit (2PC) transactions, batch writes, fault tolerance, and disk persistence.
+
+用 Python 从零手写的分布式 KV 存储引擎，从最简单的 3 节点同步一路演进到每分片独立 Raft 共识组（CockroachDB / TiKV 的核心架构），部署在 AWS 三大洲。
+
+涵盖核心分布式系统概念：Raft 共识、选主、日志复制、日志快照压缩、一致性哈希分片、线性化读、两阶段提交（2PC）事务、批量写入、故障容忍、持久化。
+
+> 附带演示：在 v1 KV store 上构建了一个分布式实时聊天室（WebSocket），验证存储层的可用性。未来计划在更完善的分布式系统上重建聊天室。
 
 ---
 
