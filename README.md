@@ -506,6 +506,47 @@ curl "http://localhost:5002/get?key=linear_key" # → forwarded_by: 5001 (if 500
 
 ---
 
+### Day 5d — Batch Writes / 第五天 d：批量写入
+
+高并发下，每次 `/set` 独立走一次 Raft round 代价很高（一次 round trip = 等所有 Follower ACK）。批量写入把多个并发请求积攒成一批，合并成一次 Raft round 提交，大幅提高吞吐量。
+
+Under high concurrency, each `/set` independently paying for a full Raft round (wait for all follower ACKs) is expensive. Batching accumulates concurrent requests and commits them in a single round.
+
+**设计 / Design：**
+
+```
+请求1 ──┐
+请求2 ──┤  batch_queue  →  batch_loop  →  一次 AppendEntries  →  全部 commit
+请求3 ──┘
+  5ms 窗口或 20 条上限        后台线程          发给所有 Follower
+```
+
+- `BATCH_MAX_SIZE = 20` — 每批最多合并 20 条 / max 20 ops per batch
+- `BATCH_TIMEOUT = 5ms` — 最长等待窗口 / max accumulation window
+- 每个分片有独立的 `batch_queue`（Condition）和 `batch_loop` 线程 / per-shard queue and thread
+- `/set` 和 `/delete` 到达后放入队列等待；`batch_loop` 统一提交后通知所有调用者 / callers block on Event until batch commits
+- `_do_raft_op` 保留用于事务提交（单条写入，不走批处理）/ kept for txn_commit
+
+**Verification / 验证：**
+```bash
+python3 test_raft_sharded.py   # 56 个测试用例，全自动
+
+# 手动验证并发写入：
+for i in {1..10}; do
+  curl -s -X POST http://localhost:5001/set \
+    -H "Content-Type: application/json" \
+    -d "{\"key\":\"k$i\",\"value\":\"v$i\"}" &
+done
+wait
+```
+
+**Automated Tests / 自动化测试：** 56/56 通过，新增 section 10：
+- 10 个并发写入全部成功（合并为 1~3 次 Raft round）
+- 5 个并发 delete 全部成功
+- 验证读回正确值、删除后 key 不存在
+
+---
+
 ## Known Limitations / 已知局限
 
 - **Simple leader election** (`node.py`) — based on lowest port number, not consensus / 选主基于端口号，非真正共识算法
