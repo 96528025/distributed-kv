@@ -1,5 +1,5 @@
 """
-分布式 KV 节点 — 分片 Raft 版（含快照压缩 + 多 key 事务 2PC）
+分布式 KV 节点 — 分片 Raft 版（含快照压缩 + 多 key 事务 2PC + 批量写入）
 
 架构：
 - 每个 key 通过一致性哈希分配到某个分片
@@ -12,6 +12,8 @@
   2. 多 key 事务（2PC）：原子地修改多个 key，使用两阶段提交保证一致性
   3. 删除操作（/delete）：通过 Raft 共识删除 key，所有节点同步
   4. 线性化读（/get 路由到 Leader）：读请求转发给分片 Leader，保证读到最新已提交数据
+  5. 批量写入（Batching）：每个分片有独立 batch_loop，积攒多个写请求合并成一次
+     Raft round，大幅提高高并发下的吞吐量
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -38,6 +40,8 @@ LEADER    = "leader"
 
 HEARTBEAT_INTERVAL = 0.5
 SNAPSHOT_THRESHOLD = 20   # log 超过 20 条就触发快照（小值方便演示）
+BATCH_MAX_SIZE     = 20   # 每批最多合并 20 条写请求
+BATCH_TIMEOUT      = 0.005  # 最长等待 5ms 积攒批次
 
 
 # ── 全局 KV 状态机（所有分片共用）────────────────────────
@@ -107,6 +111,10 @@ class ShardRaft:
         self.pending_txns = {}   # {txn_id: [{"key": ..., "value": ...}]}
         self.key_locks    = {}   # {key: txn_id}
         self.lock_expiry  = {}   # {txn_id: expire_time}
+
+        # 批量写入队列（batch_loop 专用，独立 Condition 锁，不与 shard.lock 混用）
+        self.batch_queue = []              # [{"key", "value", "op", "event", "result"}]
+        self.batch_cv    = threading.Condition()
 
 
 # 所有分片的 Raft 实例
@@ -208,6 +216,104 @@ def txn_cleanup_loop():
                         shard.key_locks.pop(op["key"], None)
                     shard.lock_expiry.pop(txn_id, None)
                     print(f"  ⏱️  分片{shard.shard_id}: 事务 {txn_id} 超时，自动释放锁")
+
+
+# ── 批量写入循环 ────────────────────────────────────────────
+def batch_loop(shard):
+    """
+    每个分片的后台批量写入线程（只有 Leader 节点实际执行写入）。
+    等待 batch_queue 有请求或超过 BATCH_TIMEOUT，将积攒的写请求合并成
+    一次 Raft AppendEntries，提交后统一通知所有等待的调用者。
+    """
+    sid = shard.shard_id
+    while True:
+        # 等待队列非空，最多等 BATCH_TIMEOUT 秒
+        with shard.batch_cv:
+            shard.batch_cv.wait_for(
+                lambda: len(shard.batch_queue) > 0,
+                timeout=BATCH_TIMEOUT,
+            )
+            if not shard.batch_queue:
+                continue
+            batch = shard.batch_queue[:BATCH_MAX_SIZE]
+            del shard.batch_queue[:BATCH_MAX_SIZE]
+
+        # 检查 Leader 身份，并将所有 ops 一次性追加到日志
+        with shard.lock:
+            if shard.role != LEADER:
+                for item in batch:
+                    item["result"][0] = (False, "not leader")
+                    item["event"].set()
+                continue
+
+            t = shard.term
+            new_entries = []
+            for item in batch:
+                entry = {"term": t, "op": item["op"], "key": item["key"]}
+                if item["op"] == "set":
+                    entry["value"] = item["value"]
+                new_entries.append(entry)
+                shard.log.append(entry)
+
+            last_abs = shard.log_offset + len(shard.log) - 1   # 最后一条的绝对 index
+
+        print(f"\n📦 [分片{sid} 批量] 合并 {len(batch)} 条写入为一次 Raft round")
+
+        # 并发复制给所有 Follower
+        acks      = [MY_PORT]
+        ack_lock  = threading.Lock()
+        ack_event = threading.Event()
+        if len(acks) >= majority():   # 单节点集群直接满足 majority
+            ack_event.set()
+
+        def replicate_to(port):
+            with shard.lock:
+                r_term    = shard.term
+                r_entries = list(shard.log)
+                r_ci      = shard.commit_index
+                r_lo      = shard.log_offset
+                r_snap    = shard.snapshot_term
+            result = send_rpc(port, "/append_entries", {
+                "shard_id":       sid,
+                "term":           r_term,
+                "leader_id":      MY_PORT,
+                "entries":        r_entries,
+                "commit_index":   r_ci,
+                "log_offset":     r_lo,
+                "prev_log_index": r_lo - 1,
+                "prev_log_term":  r_snap,
+            })
+            if result and result.get("success"):
+                with ack_lock:
+                    acks.append(port)
+                    if len(acks) >= majority():
+                        ack_event.set()
+
+        threads = [
+            threading.Thread(target=replicate_to, args=(p,), daemon=True)
+            for p in PEER_PORTS
+        ]
+        for th in threads:
+            th.start()
+        ack_event.wait(timeout=1.0)
+
+        if len(acks) >= majority():
+            with shard.lock:
+                shard.commit_index = last_abs
+            with store_lock:
+                for entry in new_entries:
+                    apply_entry(entry)
+                save_to_disk()
+            threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
+            print(f"  🎉 分片{sid} 批量提交成功（{len(batch)} 条）")
+            for item in batch:
+                item["result"][0] = (True, None)
+                item["event"].set()
+        else:
+            err = f"majority not reached ({len(acks)}/{majority()})"
+            for item in batch:
+                item["result"][0] = (False, err)
+                item["event"].set()
 
 
 # ── 选举 ───────────────────────────────────────────────────
@@ -500,8 +606,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
             return
 
-        success, err = self._do_raft_op(shard, key, value)
-        if success:
+        # Leader 路径：提交到批量队列，等待 batch_loop 统一处理
+        event  = threading.Event()
+        result = [None]
+        with shard.batch_cv:
+            shard.batch_queue.append(
+                {"key": key, "value": value, "op": "set", "event": event, "result": result}
+            )
+            shard.batch_cv.notify()
+        event.wait(timeout=2.0)
+
+        if result[0] and result[0][0]:
             with shard.lock:
                 t = shard.term
             self._respond(200, {
@@ -513,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
                 "term":       t,
             })
         else:
-            self._respond(500, {"error": err, "shard": sid})
+            self._respond(500, {"error": result[0][1] if result[0] else "timeout", "shard": sid})
 
     def _handle_delete(self, body):
         key   = body.get("key")
@@ -537,8 +652,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
             return
 
-        success, err = self._do_raft_op(shard, key, op="delete")
-        if success:
+        # Leader 路径：提交到批量队列，等待 batch_loop 统一处理
+        event  = threading.Event()
+        result = [None]
+        with shard.batch_cv:
+            shard.batch_queue.append(
+                {"key": key, "value": None, "op": "delete", "event": event, "result": result}
+            )
+            shard.batch_cv.notify()
+        event.wait(timeout=2.0)
+
+        if result[0] and result[0][0]:
             with shard.lock:
                 t = shard.term
             self._respond(200, {
@@ -550,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                 "term":       t,
             })
         else:
-            self._respond(500, {"error": err, "shard": sid})
+            self._respond(500, {"error": result[0][1] if result[0] else "timeout", "shard": sid})
 
     def _handle_vote(self, body):
         sid   = body.get("shard_id", 0)
@@ -890,6 +1014,8 @@ if __name__ == "__main__":
     threading.Thread(target=election_timer,   daemon=True).start()
     threading.Thread(target=heartbeat_loop,   daemon=True).start()
     threading.Thread(target=txn_cleanup_loop, daemon=True).start()
+    for shard in shards:
+        threading.Thread(target=batch_loop, args=(shard,), daemon=True).start()
 
     class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         """每个请求在独立线程处理，避免协调者向自身发 RPC 时死锁"""
