@@ -28,8 +28,18 @@ import random
 import os
 
 # ── 启动参数 ──────────────────────────────────────────────
-MY_PORT    = int(sys.argv[1])
-PEER_PORTS = [int(p) for p in sys.argv[2:]]
+# 支持两种格式（本地和跨机器兼容）：
+#   本地：python3 node_raft_sharded.py 5001 5002 5003
+#   云端：python3 node_raft_sharded.py 5001 54.x.x.x:5002 54.x.x.x:5003
+MY_PORT  = int(sys.argv[1])
+PEER_MAP = {}   # {port: host}，用于构造跨机器 URL
+for arg in sys.argv[2:]:
+    if ":" in arg:
+        host, port = arg.rsplit(":", 1)
+        PEER_MAP[int(port)] = host
+    else:
+        PEER_MAP[int(arg)] = "localhost"
+PEER_PORTS = list(PEER_MAP.keys())
 ALL_PORTS  = sorted([MY_PORT] + PEER_PORTS)
 NUM_SHARDS = len(ALL_PORTS)
 DISK_FILE  = f"data_raft_sharded_{MY_PORT}.json"
@@ -50,10 +60,16 @@ store_lock = threading.Lock()
 
 
 # ── 工具函数 ────────────────────────────────────────────────
+def peer_host(port):
+    """返回 port 对应的 host（本地返回 localhost，跨机器返回 IP）"""
+    if port == MY_PORT:
+        return "localhost"
+    return PEER_MAP.get(port, "localhost")
+
 def send_rpc(port, path, data, timeout=0.5):
     """发送 HTTP RPC，失败返回 None（不抛异常）"""
     try:
-        url  = f"http://localhost:{port}{path}"
+        url  = f"http://{peer_host(port)}:{port}{path}"
         body = json.dumps(data).encode()
         req  = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-type", "application/json")
@@ -65,7 +81,8 @@ def send_rpc(port, path, data, timeout=0.5):
 def send_get_rpc(port, path, timeout=0.5):
     """发送 HTTP GET RPC，失败返回 None（不抛异常）"""
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as resp:
+        url = f"http://{peer_host(port)}:{port}{path}"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
             return json.loads(resp.read())
     except Exception:
         return None
