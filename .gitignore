@@ -1,4 +1,5 @@
 data_*.json
+snapshot_*.json
 __pycache__/
 *.pyc
 venv/
