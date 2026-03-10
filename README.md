@@ -549,12 +549,11 @@ wait
 
 ## Known Limitations / 已知局限
 
-- **Simple leader election** (`node.py`) — based on lowest port number, not consensus / 选主基于端口号，非真正共识算法
-- **No replication per shard** (`node_sharded.py`) — if a node dies, its keys are unavailable / 分片版无副本，节点挂了该分片不可用
-- **Raft without log compaction** (`node_raft.py`) — log grows unbounded; real systems use snapshots / Raft 没有日志压缩，真实系统需要快照
-- **No conflict resolution** (`node.py`) — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
-- **No Raft in replicated shards** (`node_replicated.py`) — primary elected by simple alive-check, not consensus; writes may be lost if primary crashes before replication / 分片primary选举无共识，primary宕机前未同步的写入会丢失 *(fixed in v5)*
-- **No log compaction** — log grows unbounded; real systems use snapshots / 日志无压缩，真实系统需要快照（所有版本）
-- **No conflict resolution** (`node.py`) — split-brain recovery uses last-write-wins / 脑裂恢复用最后写入覆盖
+These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`node.py`, `node_sharded.py`, etc.) have additional limitations documented in their respective Day sections above.
 
-Next steps: Raft log compaction / snapshots, multi-key transactions, linearizable reads. / 下一步：Raft 日志快照压缩、多 key 事务、线性化读。
+以下局限针对最新版本 `node_raft_sharded.py`。早期版本的局限见上方各 Day 章节。
+
+- **Fixed cluster size** — adding or removing nodes requires a restart; no dynamic membership changes / 节点数固定，无法动态扩缩容
+- **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
+- **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
+- **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口
