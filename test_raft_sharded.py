@@ -460,6 +460,51 @@ for port in PORTS:
           f"value={r.get('value') if r else 'None'}")
 
 
+# ── 10. 批量写入（并发请求合并为一次 Raft round）──────────
+section("10. 批量写入（10 个并发请求）")
+
+batch_results = [None] * 10
+
+def do_batch_set(i):
+    batch_results[i] = http_post(PORTS[0], "/set",
+                                 {"key": f"batch_k{i}", "value": f"batch_v{i}"})
+
+threads = [threading.Thread(target=do_batch_set, args=(i,)) for i in range(10)]
+for th in threads:
+    th.start()
+for th in threads:
+    th.join()
+
+ok_count = sum(1 for r in batch_results if r and r.get("status") == "ok")
+check(f"10 个并发写入全部成功（{ok_count}/10）", ok_count == 10,
+      str([r.get("status") if r else "None" for r in batch_results]))
+
+time.sleep(0.5)
+for i in [0, 4, 9]:
+    r = http_get(PORTS[0], f"/get?key=batch_k{i}")
+    check(f"batch_k{i} 写入正确", r and r.get("value") == f"batch_v{i}",
+          f"value={r.get('value') if r else 'None'}")
+
+# 验证并发 delete 也能批处理
+del_results = [None] * 5
+
+def do_batch_del(i):
+    del_results[i] = http_post(PORTS[0], "/delete", {"key": f"batch_k{i}"})
+
+threads = [threading.Thread(target=do_batch_del, args=(i,)) for i in range(5)]
+for th in threads:
+    th.start()
+for th in threads:
+    th.join()
+
+del_ok = sum(1 for r in del_results if r and r.get("status") == "ok")
+check(f"5 个并发 delete 全部成功（{del_ok}/5）", del_ok == 5)
+
+time.sleep(0.5)
+r = http_get(PORTS[0], "/get?key=batch_k0")
+check("batch_k0 已被删除", r is None or "error" in (r or {}))
+
+
 # ══════════════════════════════════════════════════════════
 #  汇总结果
 # ══════════════════════════════════════════════════════════
