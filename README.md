@@ -12,6 +12,32 @@ Demonstrates core distributed systems concepts: Raft consensus, leader election,
 
 ---
 
+## Verified: 56/56 automated tests passing / 自动化测试全部通过
+
+The full Raft + sharding + transaction suite is reproducible in one command — no external dependencies, it spins up a real 3-node cluster on `localhost:5001-5003`:
+
+一条命令即可复现完整的 Raft + 分片 + 事务测试，无需外部依赖，会真实拉起 `localhost:5001-5003` 三节点集群：
+
+```console
+$ python3 test_raft_sharded.py
+  ✅ PASS  集群启动并完成选举
+  ✅ PASS  向非 Leader 写入（自动转发到 Leader）
+  ✅ PASS  日志快照压缩（写满 60 条触发快照，log 截断至 20）
+  ✅ PASS  节点重启后从快照恢复，数据不丢
+  ✅ PASS  Follower 落后拉快照（install_snapshot）
+  ✅ PASS  多 key 事务提交 / 锁冲突 abort / 锁超时自动释放
+  ✅ PASS  线性化读（Leader 直读，Follower 转发）
+  ✅ PASS  10 并发写入 + 5 并发删除全部成功
+  ...
+───────────────────────────────────────────────────────
+  🎉 全部通过：56/56
+───────────────────────────────────────────────────────
+```
+
+Covers leader election, log replication, snapshot compaction & recovery, `install_snapshot` catch-up, 2PC multi-key transactions (commit / lock-conflict abort / lock-timeout release), linearizable reads, and concurrent batch writes/deletes.
+
+---
+
 ## Architecture / 架构
 
 ### Chat System (v1 KV + chat servers) / 聊天系统架构
