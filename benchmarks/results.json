@@ -1,0 +1,250 @@
+{
+  "timestamp": "2026-07-23T00:00:19",
+  "config": {
+    "target": "localhost:5001",
+    "ports": [
+      5001,
+      5002,
+      5003
+    ],
+    "num_shards": 3,
+    "requests_per_test": 1500,
+    "value_size": 100,
+    "per_op_concurrency": 50,
+    "repeats_for_comparisons": 5,
+    "batch_max_size": 20,
+    "batch_timeout_ms": 5,
+    "isolation": "fresh cluster per measurement",
+    "routing": "client-side leader routing (per-key → shard leader)",
+    "transport": "HTTP/1.0 + JSON (urllib, 每请求新建 TCP 连接)",
+    "python": "3.14.6"
+  },
+  "results": [
+    {
+      "test": "set@c1",
+      "concurrency": 1,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 6.9251,
+      "throughput_ops_s": 216.6,
+      "mean_ms": 4.566,
+      "p50_ms": 4.431,
+      "p95_ms": 6.324,
+      "p99_ms": 8.059,
+      "max_ms": 54.812
+    },
+    {
+      "test": "set@c10",
+      "concurrency": 10,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 2.571,
+      "throughput_ops_s": 583.4,
+      "mean_ms": 17.038,
+      "p50_ms": 15.974,
+      "p95_ms": 29.799,
+      "p99_ms": 37.959,
+      "max_ms": 108.173
+    },
+    {
+      "test": "set@c50",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 4.3647,
+      "throughput_ops_s": 343.7,
+      "mean_ms": 119.55,
+      "p50_ms": 60.87,
+      "p95_ms": 377.398,
+      "p99_ms": 1138.699,
+      "max_ms": 3964.74
+    },
+    {
+      "test": "set@c100",
+      "concurrency": 100,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 4.0187,
+      "throughput_ops_s": 373.3,
+      "mean_ms": 136.123,
+      "p50_ms": 42.318,
+      "p95_ms": 581.099,
+      "p99_ms": 2029.116,
+      "max_ms": 3967.522
+    },
+    {
+      "test": "set@c200",
+      "concurrency": 200,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 4.4219,
+      "throughput_ops_s": 339.2,
+      "mean_ms": 270.035,
+      "p50_ms": 51.329,
+      "p95_ms": 2029.305,
+      "p99_ms": 2062.35,
+      "max_ms": 4002.85
+    },
+    {
+      "test": "set",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 2.0896,
+      "throughput_ops_s": 717.8,
+      "mean_ms": 54.207,
+      "p50_ms": 27.359,
+      "p95_ms": 149.122,
+      "p99_ms": 374.683,
+      "max_ms": 2060.98
+    },
+    {
+      "test": "get",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 0.637,
+      "throughput_ops_s": 2354.9,
+      "mean_ms": 20.4,
+      "p50_ms": 16.22,
+      "p95_ms": 35.821,
+      "p99_ms": 123.616,
+      "max_ms": 237.75
+    },
+    {
+      "test": "txn",
+      "concurrency": 50,
+      "ok": 1423,
+      "err": 77,
+      "wall_s": 35.1143,
+      "throughput_ops_s": 40.5,
+      "mean_ms": 1130.574,
+      "p50_ms": 891.658,
+      "p95_ms": 2368.211,
+      "p99_ms": 3132.565,
+      "max_ms": 6298.301
+    },
+    {
+      "test": "set_serial",
+      "concurrency": 1,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 7.8071,
+      "throughput_ops_s": 192.1,
+      "mean_ms": 5.142,
+      "p50_ms": 4.773,
+      "p95_ms": 8.053,
+      "p99_ms": 12.477,
+      "max_ms": 65.175
+    },
+    {
+      "test": "set_concurrent",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 2.3194,
+      "throughput_ops_s": 646.7,
+      "mean_ms": 46.18,
+      "p50_ms": 22.528,
+      "p95_ms": 139.938,
+      "p99_ms": 357.656,
+      "max_ms": 2027.484
+    },
+    {
+      "test": "shard_single",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 2.0693,
+      "throughput_ops_s": 724.9,
+      "mean_ms": 32.039,
+      "p50_ms": 14.439,
+      "p95_ms": 99.207,
+      "p99_ms": 221.126,
+      "max_ms": 2043.14
+    },
+    {
+      "test": "shard_spread",
+      "concurrency": 50,
+      "ok": 1500,
+      "err": 0,
+      "wall_s": 4.0179,
+      "throughput_ops_s": 373.3,
+      "mean_ms": 62.758,
+      "p50_ms": 21.589,
+      "p95_ms": 118.726,
+      "p99_ms": 1069.046,
+      "max_ms": 3970.025
+    }
+  ],
+  "batch_speedup": 3.37,
+  "shard_speedup": 0.52,
+  "batch_meta": {
+    "serial": {
+      "runs_ops_s": [
+        192.1,
+        212.0,
+        190.5,
+        200.2,
+        161.0
+      ],
+      "leader_spread_each": [
+        1,
+        2,
+        3,
+        2,
+        2
+      ]
+    },
+    "concurrent": {
+      "runs_ops_s": [
+        635.7,
+        249.9,
+        1259.6,
+        1476.8,
+        646.7
+      ],
+      "leader_spread_each": [
+        1,
+        2,
+        3,
+        3,
+        2
+      ]
+    }
+  },
+  "shard_meta": {
+    "single": {
+      "runs_ops_s": [
+        706.1,
+        724.9,
+        406.7,
+        1366.6,
+        1132.8
+      ],
+      "leader_spread_each": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    "spread": {
+      "runs_ops_s": [
+        628.3,
+        371.7,
+        251.0,
+        373.3,
+        640.1
+      ],
+      "leader_spread_each": [
+        1,
+        1,
+        2,
+        2,
+        2
+      ]
+    }
+  }
+}

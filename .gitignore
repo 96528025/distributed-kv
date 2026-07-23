@@ -3,3 +3,8 @@ snapshot_*.json
 __pycache__/
 *.pyc
 venv/
+
+# benchmark 运行产物（保留结果与图，忽略日志和临时集群状态）
+benchmarks/full_run.log
+benchmarks/node_logs/
+benchmarks/_cluster_state/
