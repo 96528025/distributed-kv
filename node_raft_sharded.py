@@ -27,13 +27,33 @@ import time
 import random
 import os
 
+import storage as storage_mod   # 单节点持久化引擎（storage.py）
+
 # ── 启动参数 ──────────────────────────────────────────────
 # 支持两种格式（本地和跨机器兼容）：
 #   本地：python3 node_raft_sharded.py 5001 5002 5003
 #   云端：python3 node_raft_sharded.py 5001 54.x.x.x:5002 54.x.x.x:5003
-MY_PORT  = int(sys.argv[1])
+#
+# 可选持久化配置（命令行 --flag，或对应环境变量；命令行优先）：
+#   --backend=json|wal    (KV_BACKEND)        默认 json（legacy，行为与旧版一致）
+#   --data-dir=PATH       (KV_DATA_DIR)       默认当前目录
+#   --fsync               (KV_FSYNC=1)        每次 commit 后 fsync（默认关，仅 flush）
+#   --rotate-records=N    (KV_ROTATE_RECORDS) WAL 轮换阈值（条数），默认 1000
+_flags = {}
+_positional = []
+for arg in sys.argv[1:]:
+    if arg.startswith("--"):
+        if "=" in arg:
+            k, v = arg[2:].split("=", 1)
+        else:
+            k, v = arg[2:], "1"
+        _flags[k] = v
+    else:
+        _positional.append(arg)
+
+MY_PORT  = int(_positional[0])
 PEER_MAP = {}   # {port: host}，用于构造跨机器 URL
-for arg in sys.argv[2:]:
+for arg in _positional[1:]:
     if ":" in arg:
         host, port = arg.rsplit(":", 1)
         PEER_MAP[int(port)] = host
@@ -42,7 +62,25 @@ for arg in sys.argv[2:]:
 PEER_PORTS = list(PEER_MAP.keys())
 ALL_PORTS  = sorted([MY_PORT] + PEER_PORTS)
 NUM_SHARDS = len(ALL_PORTS)
-DISK_FILE  = f"data_raft_sharded_{MY_PORT}.json"
+
+# 持久化配置（命令行 > 环境变量 > 默认值）
+def _cfg(flag, env, default):
+    if flag in _flags:
+        return _flags[flag]
+    return os.environ.get(env, default)
+
+DATA_DIR = _cfg("data-dir", "KV_DATA_DIR", ".")
+BACKEND  = _cfg("backend",  "KV_BACKEND",  "json")
+FSYNC    = str(_cfg("fsync", "KV_FSYNC", "0")).lower() in ("1", "true", "yes")
+ROTATE_RECORDS = int(_cfg("rotate-records", "KV_ROTATE_RECORDS", "1000"))
+
+DISK_FILE  = os.path.join(DATA_DIR, f"data_raft_sharded_{MY_PORT}.json")
+
+# 全局持久化引擎（在 store_lock 内调用；引擎内部自带锁，锁序 store_lock → engine._lock）
+storage = storage_mod.create_storage_engine(storage_mod.StorageConfig(
+    backend=BACKEND, data_dir=DATA_DIR, port=MY_PORT,
+    fsync=FSYNC, rotate_records=ROTATE_RECORDS,
+))
 
 FOLLOWER  = "follower"
 CANDIDATE = "candidate"
@@ -139,20 +177,30 @@ shards = [ShardRaft(i) for i in range(NUM_SHARDS)]
 
 
 # ── 持久化 ─────────────────────────────────────────────────
-def save_to_disk():
-    """调用前必须持有 store_lock，且不能持有任何 shard.lock"""
-    with open(DISK_FILE, "w") as f:
-        json.dump(store, f)
+# 所有**已提交**的状态机 apply 都经过统一的 persistence path，
+# 由全局 `storage` 引擎（json 或 wal 后端）承接。调用约定：
+#   - 调用方必须持有 store_lock（保证 store 与引擎的 applied 元数据一致），
+#   - 且**不能**持有任何 shard.lock（避免长时间磁盘 I/O 卡住 Raft，也避免新的锁序）。
+def persist_committed(records):
+    """持久化一批已提交操作。records: list[storage.WalRecord]，已应用到内存 store。"""
+    storage.commit(store, records)
+
+
+def snapshot_path(shard_id):
+    return os.path.join(DATA_DIR, f"snapshot_{MY_PORT}_shard{shard_id}.json")
+
 
 def load_from_disk():
-    if os.path.exists(DISK_FILE):
-        with open(DISK_FILE, "r") as f:
-            store.update(json.load(f))
-        print(f"  💾 从磁盘恢复了 {len(store)} 条数据")
+    # 1) 由存储引擎恢复 store（json：读全量文件；wal：读 checkpoint 并 replay WAL）
+    recovered = storage.load()
+    if recovered:
+        store.update(recovered)
+        print(f"  💾 [{BACKEND}] 从存储引擎恢复了 {len(store)} 条数据")
 
-    # 加载各分片快照（会覆盖磁盘 KV，因为快照版本更新）
+    # 2) 加载各分片 Raft 快照（这是 Raft 日志压缩状态，与 storage 后端正交；
+    #    快照里的 store 也是已提交数据，update 进去是幂等安全的）
     for shard in shards:
-        fname = f"snapshot_{MY_PORT}_shard{shard.shard_id}.json"
+        fname = snapshot_path(shard.shard_id)
         if os.path.exists(fname):
             with open(fname, "r") as f:
                 snap = json.load(f)
@@ -192,7 +240,7 @@ def maybe_snapshot(shard):
         snap_entry = shard.log[cut - 1]
 
     # 写快照文件（在锁外做 I/O）
-    fname = f"snapshot_{MY_PORT}_shard{shard.shard_id}.json"
+    fname = snapshot_path(shard.shard_id)
     snapshot_data = {
         "snapshot_index": ci,
         "snapshot_term":  snap_entry["term"],
@@ -264,6 +312,7 @@ def batch_loop(shard):
                 continue
 
             t = shard.term
+            base_abs = shard.log_offset + len(shard.log)   # 本批第一条的绝对 index
             new_entries = []
             for item in batch:
                 entry = {"term": t, "op": item["op"], "key": item["key"]}
@@ -318,9 +367,14 @@ def batch_loop(shard):
             with shard.lock:
                 shard.commit_index = last_abs
             with store_lock:
-                for entry in new_entries:
+                records = []
+                for offset, entry in enumerate(new_entries):
                     apply_entry(entry)
-                save_to_disk()
+                    records.append(storage_mod.WalRecord(
+                        shard_id=sid, index=base_abs + offset, term=t,
+                        op=entry["op"], key=entry["key"], value=entry.get("value"),
+                    ))
+                persist_committed(records)
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
             print(f"  🎉 分片{sid} 批量提交成功（{len(batch)} 条）")
             for item in batch:
@@ -592,7 +646,10 @@ class Handler(BaseHTTPRequestHandler):
                 shard.commit_index = log_index
             with store_lock:
                 apply_entry(entry)
-                save_to_disk()
+                persist_committed([storage_mod.WalRecord(
+                    shard_id=sid, index=log_index, term=t,
+                    op=op, key=key, value=(value if op == "set" else None),
+                )])
             print(f"  🎉 分片{sid} 已提交：{label}")
             # 异步触发快照（不阻塞当前请求）
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
@@ -781,7 +838,7 @@ class Handler(BaseHTTPRequestHandler):
                 for abs_i in range(start_abs, end_abs):
                     rel_i = abs_i - shard.log_offset
                     if 0 <= rel_i < len(shard.log):
-                        to_apply.append(shard.log[rel_i])
+                        to_apply.append((abs_i, shard.log[rel_i]))   # (绝对 index, entry)
                 shard.commit_index = new_commit
 
             resp_term = shard.term
@@ -794,15 +851,17 @@ class Handler(BaseHTTPRequestHandler):
             if snap and "snapshot_index" in snap:
                 with store_lock:
                     store.update(snap["store"])
-                    save_to_disk()
+                    # 安装快照 = 一次全量 state 安装，对存储引擎而言等价于发布 checkpoint：
+                    # 记录该分片已应用到 snapshot_index，并（WAL 后端）截断旧 WAL。
+                    storage.checkpoint(store, {sid: snap["snapshot_index"]})
                 with shard.lock:
                     shard.snapshot_index = snap["snapshot_index"]
                     shard.snapshot_term  = snap["snapshot_term"]
                     shard.log_offset     = snap["log_offset"]
                     shard.commit_index   = snap["snapshot_index"]
                     shard.log            = snap.get("tail_log", [])
-                # 写快照到本地磁盘
-                fname = f"snapshot_{MY_PORT}_shard{sid}.json"
+                # 写 Raft 快照到本地磁盘
+                fname = snapshot_path(sid)
                 with open(fname, "w") as f:
                     json.dump({
                         "snapshot_index": snap["snapshot_index"],
@@ -814,9 +873,15 @@ class Handler(BaseHTTPRequestHandler):
                       f"（snapshot_index={snap['snapshot_index']}）")
         elif to_apply:
             with store_lock:
-                for entry in to_apply:
+                records = []
+                for abs_i, entry in to_apply:
                     apply_entry(entry)
-                save_to_disk()
+                    records.append(storage_mod.WalRecord(
+                        shard_id=sid, index=abs_i, term=entry["term"],
+                        op=entry.get("op", "set"), key=entry["key"],
+                        value=entry.get("value"),
+                    ))
+                persist_committed(records)
             # Follower 也触发快照检查（日志超阈值时生成快照文件，重启不依赖磁盘文件）
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
 

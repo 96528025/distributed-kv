@@ -1,5 +1,9 @@
 data_*.json
 snapshot_*.json
+# WAL 后端产生的持久化状态文件（运行时生成，不入库）
+wal_*.log
+checkpoint_*.json
+checkpoint_*.json.tmp
 __pycache__/
 *.pyc
 venv/

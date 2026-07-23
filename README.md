@@ -80,6 +80,145 @@ Covers leader election, log replication, snapshot compaction & recovery, `instal
 
 ---
 
+## Persistence: WAL + Checkpoint / 持久化：预写日志 + 检查点
+
+> 代码：[`storage.py`](storage.py)（存储引擎）· 集成点在 [`node_raft_sharded.py`](node_raft_sharded.py)
+> · 测试 [`test_wal.py`](test_wal.py) · 基准 [`benchmark_storage.py`](benchmark_storage.py) / [`benchmarks/storage_benchmark.md`](benchmarks/storage_benchmark.md)
+
+### 原持久化路径的问题 / The problem
+
+旧的 `save_to_disk()` **每次提交都把整个 store 全量重写成一个 JSON 文件**
+（`json.dump(store)`）。单次提交的磁盘成本是 **O(数据量)**：库里有 N 条，
+每写 1 条就要把 N 条全部序列化落盘一次。实测（[基准](benchmarks/storage_benchmark.md)）：
+数据从 100 → 50,000 条时，单次写吞吐从 **1400 → 28 ops/s（跌约 50×）**，
+p50 延迟从 **0.72ms → 35ms（涨约 49×）**。这是纯粹的写放大。
+
+### 新架构 / The architecture
+
+引入 `StorageEngine` 抽象，两个后端实现同一套接口，通过配置/命令行选择：
+
+| 后端 | 说明 | 单次写成本 |
+|---|---|---|
+| **`json`**（默认，legacy） | 保留旧的全量重写路径，向后兼容、作为基准对照 | O(数据量) |
+| **`wal`**（opt-in） | append-only WAL + 原子 checkpoint 恢复 | O(1) 追加，checkpoint 时摊薄一次 O(N) |
+
+> **默认仍是 `json`**：保证现有行为与 56/56 测试**零改动**；WAL 为显式开启（opt-in），
+> 见下方「如何选择 backend」。这样升级不冒任何回归风险，WAL 的收益按需启用。
+
+```mermaid
+flowchart TD
+    subgraph one["一次已提交写入的落盘路径（WAL 后端）"]
+        A["Raft 多数派确认<br/>（commit_index 前进）"] --> B["apply_entry() 改内存 store<br/>（持 store_lock）"]
+        B --> C["storage.commit(store, records)<br/>append 定长帧到 WAL + flush"]
+        C --> D{"累计 ≥ rotate_records<br/>或 WAL ≥ rotate_bytes ?"}
+        D -- 否 --> E["返回（O(1)）"]
+        D -- 是 --> F["checkpoint：写 store 全量到 tmp<br/>→ fsync → 原子 rename<br/>→ **之后**才截断 WAL"]
+    end
+    subgraph rec["崩溃恢复路径（启动时）"]
+        R1["读最新有效 checkpoint<br/>(store + 每分片 applied index)"] --> R2["从 checkpoint 之后 replay WAL"]
+        R2 --> R3["index ≤ applied 的记录跳过（幂等）"]
+        R3 --> R4["尾部半写：保留此前记录，安全停止"]
+        R3 --> R5["中间 crc/对齐损坏：报错，不静默"]
+    end
+```
+
+### 写入流程 / Write flow（只持久化已提交操作）
+
+1. Raft 达成多数派 → 该条目 committed，`commit_index` 前进；
+2. 在 `store_lock` 内 `apply_entry()` 改内存 store；
+3. **同一个 `store_lock` 临界区**内调用 `storage.commit(store, records)`：
+   把每条 committed 操作编码成一条**定长帧 WAL 记录**并 append，然后 `flush()`；
+4. 若累计记录数 / 文件大小达阈值 → 触发一次 checkpoint（见下）并轮换 WAL。
+
+所有已提交的状态机 apply 路径（batch 写、事务 commit 逐条、follower apply、
+安装快照）**都走这一条统一的 persistence path**，不会出现「set 有 WAL、delete 没有」
+或「Leader 有、Follower 没有」这类漏写。
+
+### WAL 记录格式 / Record format（length-prefixed，可靠识别半写）
+
+```
+每条记录：MAGIC(4) | payload_len(4, 大端) | payload(JSON) | crc32(4, 大端)
+payload = {v:版本, s:shard_id, i:绝对index, t:term, o:op, k:key, d:value}
+```
+
+- **MAGIC** 用于校验「帧对齐」，把**中间损坏**（错位）与**尾部半写**（截断）区分开；
+- **crc32** 覆盖 payload，检测内容损坏；
+- 定长长度前缀让 replay **不依赖换行完整**，可靠识别最后一条 partial write。
+
+### 恢复流程 / Recovery flow
+
+启动时 `storage.load()`：
+1. 加载最新有效 checkpoint → 得到 store 全量 + 每个分片的 `applied` 绝对 index；
+2. 从 WAL 顺序 replay，**只应用 `index > applied[shard]` 的记录**（幂等去重）；
+3. 正确恢复 `set` / `delete`；
+4. **尾部 partial record**：保留此前所有有效记录并安全停止；
+5. **中间 checksum / 帧对齐损坏**：抛 `StorageCorruptionError`，**绝不静默继续**。
+
+Replay 幂等，可安全重复执行。
+
+### Checkpoint 的原子发布顺序 / Atomic checkpoint ordering（崩溃安全）
+
+checkpoint 包含：当前 store 全量、每个分片已应用到的绝对 index、版本 + sha256 校验。
+发布严格按此顺序，**核心不变式：checkpoint 必须 fsync+rename 落盘后，才允许截断 WAL**：
+
+1. 把 store 全量 + applied 写到 `checkpoint_<port>.json.tmp`，`flush()` + **`fsync()`**；
+2. `os.replace(tmp, final)` **原子** rename 发布（+ 对目录 fsync 让 rename 持久）；
+3. **只有** checkpoint 安全落盘后，才截断/轮换 WAL。
+
+对应四个崩溃点都安全：
+
+| 崩溃点 | 结果 | 为什么安全 |
+|---|---|---|
+| checkpoint 只写了一半 | 只污染 `.tmp` | final checkpoint 未变，恢复用旧 checkpoint + 全量 WAL |
+| checkpoint 完成但 WAL 未轮换 | 新 checkpoint 生效 + WAL 仍有旧记录 | replay 时 `index ≤ applied` 被跳过，不重复应用 |
+| WAL 准备轮换但旧文件仍在 | 同上 | replay 幂等 |
+| checkpoint 与清理旧日志之间退出 | 同上 | replay 幂等，既不丢也不重放 committed 操作 |
+
+### Durability policy / 持久性策略
+
+- **`flush()` ≠ `fsync()`**（本项目明确区分，不混淆）：
+  - `flush()` 把字节从 Python 缓冲交给 **OS 页缓存** → 足以扛**进程崩溃 / `kill -9`**
+    （进程死了，页缓存还在，OS 稍后自然落盘）；
+  - `fsync()` 才把数据推到**物理磁盘** → 才能扛**掉电 / OS 崩溃**。
+- **默认策略**：每次 committed batch 后 `flush()`；`fsync` **可配置，默认关**（性能优先）。
+  `test_wal.py` 的 SIGKILL 集成测试证明：即便不 fsync，`flush()` 也能扛住强杀恢复。
+- **checkpoint 一律 fsync**：它是恢复的唯一可信基点，且顺序上先于 WAL 截断。
+- 打开掉电级持久：`--fsync`（或 `KV_FSYNC=1`），每次写多一次磁盘同步，吞吐会下降。
+
+### Raft log 与 storage WAL 的区别 / Raft log vs storage WAL（关键概念）
+
+| | **Raft log**（`shard.log`） | **Storage WAL**（`wal_<port>.log`） |
+|---|---|---|
+| 目的 | **多节点复制与共识** | **单节点磁盘持久化与崩溃恢复** |
+| 内容 | 尚未 committed 也可能包含 | **只有已 committed、准备 apply 的操作** |
+| 作用域 | 一个 Raft 组（跨节点） | 一个进程（本机） |
+| 可变性 | 未提交条目可能因冲突被截断/覆盖 | 只追加已提交操作（提交后不再改变） |
+
+**为什么 WAL 只记录已 committed 操作？** 因为 storage WAL 的职责是「让本节点崩溃后能恢复
+到它已经确认的状态机状态」。未提交的 Raft 条目还可能被更高 term 的 Leader 覆盖，
+把它们持久化进状态机 WAL 会导致恢复出「从未真正提交过」的数据。Raft 的复制/持久由
+`shard.log` 及快照负责；storage WAL 站在**状态机之后**，只接收已定稿的操作。
+
+### 如何选择 backend / Selecting a backend
+
+命令行 `--flag` 优先，其次同名环境变量，最后默认值：
+
+```bash
+# 默认 json（legacy，行为与旧版一致）
+python3 node_raft_sharded.py 5001 5002 5003
+
+# 开启 WAL 后端
+python3 node_raft_sharded.py 5001 5002 5003 --backend=wal
+KV_BACKEND=wal python3 node_raft_sharded.py 5001 5002 5003
+
+# 其它可选项
+--data-dir=PATH        # (KV_DATA_DIR)        状态文件目录，默认当前目录
+--fsync                # (KV_FSYNC=1)         每次 commit 后 fsync（掉电级持久）
+--rotate-records=N     # (KV_ROTATE_RECORDS)  WAL 轮换阈值（条），默认 1000
+```
+
+---
+
 ## Features / 功能
 
 **Distributed KV Store**
@@ -145,7 +284,13 @@ python3 node_raft_sharded.py 5003 5001 5002 &
 sleep 5
 
 # 运行自动化测试 / Run automated tests
-python3 test_raft_sharded.py
+python3 test_raft_sharded.py          # 现有集群测试（56/56）
+python3 test_wal.py                    # WAL 存储引擎测试（15/15，含 SIGKILL 恢复）
+python3 test_wal.py --unit-only        # 只跑快速存储层单元测试（13 个，秒级）
+
+# 持久化后端基准（JSON 全量重写 vs WAL 追加）/ Storage backend benchmark
+python3 benchmark_storage.py           # 见 benchmarks/storage_benchmark.md
+python3 benchmark_storage.py --quick   # 快速冒烟
 ```
 
 ### Cloud (AWS) / 云端运行
@@ -201,7 +346,10 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | File / 文件 | What it does / 功能 |
 |-------------|---------------------|
 | `client.py` | 交互式命令行客户端，手动操作 v1 KV store（get / set / lpush / lrange 等） |
+| `storage.py` | **持久化引擎抽象**：`StorageEngine` 接口 + `JsonStorageEngine`（legacy 全量重写）+ `WalStorageEngine`（WAL + 原子 checkpoint 恢复）。详见 [Persistence 章节](#persistence-wal--checkpoint--持久化预写日志--检查点) |
 | `test_raft_sharded.py` | v5 的全自动测试套件（56 个用例，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、线性化读、批量写入 |
+| `test_wal.py` | WAL 存储引擎测试（15 个用例，含真实节点 SIGKILL 恢复集成测试）。覆盖：set/delete/多分片/batch/事务恢复、幂等 replay、尾部半写、checksum 损坏、无效 checkpoint、轮换后恢复、JSON 兼容 |
+| `benchmark_storage.py` | 公平对比 legacy JSON 全量重写 vs WAL 追加（吞吐 / p50-p99 延迟 / 数据规模 / 存储增长 / 恢复时间 / batching）。结果见 [`benchmarks/storage_benchmark.md`](benchmarks/storage_benchmark.md) |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
 | `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
@@ -649,3 +797,22 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 - **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
 - **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口
+
+### 持久化（WAL 后端）已知局限 / Persistence (WAL backend) limitations
+
+- **WAL 为 opt-in，默认仍是 legacy JSON**：需 `--backend=wal` 显式开启；默认路径未变，
+  以保证零回归。/ WAL is opt-in; the default remains legacy JSON full-rewrite.
+- **checkpoint 时 store_lock 短暂阻塞**：轮换 checkpoint 会在 `store_lock` 内做一次
+  O(N) 全量落盘 + fsync，期间本节点写入短暂停顿。轮换不频繁（每 `rotate_records` 次），
+  是「简单可验证」优先于「零停顿」的自觉取舍。/ Rotation checkpoints briefly hold
+  `store_lock` during an O(N) fsync; infrequent, a deliberate simplicity trade-off.
+- **fsync 默认关**：默认只 `flush()`，扛进程崩溃/`kill -9` 但不扛掉电；掉电级持久需 `--fsync`。
+- **损坏的 WAL 长度头指向文件尾之外**时，保守判为「尾部截断」而保留此前记录；
+  记录体内的中间位翻转由 CRC/MAGIC 可靠检出。这是无 per-record 序列号格式的固有边界。
+  / A corrupt length field pointing past EOF is conservatively treated as a truncated tail;
+  in-body bit-rot is caught by CRC/MAGIC.
+- **单 WAL 文件、单层 checkpoint**：不做 SSTable / LSM / 多层 compaction（超出本任务范围）。
+  恢复需 replay 自上次 checkpoint 以来的 WAL，`rotate_records` 越大恢复越久（写放大 ↔ 恢复时长旋钮）。
+- **WAL 落盘体积略大于紧凑 JSON**：append 日志本身更大，由 checkpoint 轮换封顶。
+- **Raft 快照与 storage checkpoint 是两套文件**：前者服务 Raft 日志压缩/follower 追赶，
+  后者服务本机崩溃恢复；二者正交，均落盘（见上文「Raft log 与 storage WAL 的区别」）。
