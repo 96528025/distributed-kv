@@ -14,7 +14,7 @@ Demonstrates core distributed systems concepts: Raft consensus, leader election,
 
 ---
 
-## Verified: 56/56 automated tests passing / 自动化测试全部通过
+## Verified: 56/56 automated integration checks passing / 自动化集成检查全部通过
 
 The full Raft + sharding + transaction suite is reproducible in one command — no external dependencies, it spins up a real 3-node cluster on `localhost:5001-5003`:
 
