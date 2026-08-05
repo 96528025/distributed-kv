@@ -4,15 +4,21 @@
 运行方式：
   python3 test_raft_sharded.py
 
-测试覆盖：
+测试覆盖（section 编号与运行输出一致）：
+  0. 准备环境：清理旧文件 + 启动三节点集群 + 等待各分片选出 Leader
   1. 基础读写
   2. Leader 转发（向非 Leader 节点写入）
   3. 日志快照压缩（写够 60 条触发快照，验证文件生成 + log 截断）
-  4. 快照恢复（重启节点，验证数据不丢）
-  5. Follower 落后拉快照（install_snapshot 流程）
-  6. 多 key 事务（正常提交）
-  7. 事务锁冲突（prepare 冲突 → abort）
-  8. 事务锁超时自动释放（等待 cleanup_loop）
+  4. 快照恢复 / Follower 落后追赶（重启节点，走 install_snapshot，验证数据不丢）
+  5. 多 key 事务（2PC 正常提交）
+  6. 事务锁冲突（prepare 冲突 → abort）
+  7. 事务锁超时自动释放（等待 cleanup_loop）
+  8. /delete 端点（含转发、幂等、删后重写）
+  9. 线性化读（/get 路由到 Leader）
+ 10. 批量写入（10 并发 set + 5 并发 delete 合并为一次 Raft round）
+
+这是一个集成测试脚本，不是 unittest/pytest 套件：
+上述 11 个 section 在运行时共产生 56 个断言（check），全部通过时输出 56/56。
 """
 
 import json
@@ -24,6 +30,7 @@ import urllib.error
 import os
 import glob
 import threading
+import atexit
 
 # ── 配置 ──────────────────────────────────────────────────
 PORTS   = [5001, 5002, 5003]
@@ -117,6 +124,16 @@ def clean_files():
         os.remove(f)
     for f in glob.glob(os.path.join(BASE, "data_raft_sharded_*.json")):
         os.remove(f)
+
+
+def _final_cleanup():
+    """无论正常结束、测试失败还是中途抛异常/Ctrl-C，都保证节点进程被杀掉、
+    生成的 data/snapshot 文件被清理。没有这个钩子时，异常路径会留下三个
+    node_raft_sharded.py 进程占着 5001-5003 端口。"""
+    stop_all()
+    clean_files()
+
+atexit.register(_final_cleanup)
 
 def get_shard_leader(key):
     """通过任意节点找到 key 所在分片的 Leader"""
