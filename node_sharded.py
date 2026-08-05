@@ -1,6 +1,6 @@
 """
 分布式 KV 节点 — 分片版
-核心改动：用一致性哈希决定每个 key 由哪个节点负责
+核心改动：用哈希取模（MD5(key) % 节点数）决定每个 key 由哪个节点负责
 - 写入时：如果这个 key 不属于我，自动转发给正确的节点
 - 读取时：如果这个 key 不属于我，自动转发给正确的节点
 - 不再有单一 Leader，每个节点都是自己负责的 key 的 Leader
@@ -22,9 +22,10 @@ ALL_PORTS = sorted([int(p) for p in sys.argv[1:]])
 PEER_PORTS = [p for p in ALL_PORTS if p != MY_PORT]
 DISK_FILE = f"data_sharded_{MY_PORT}.json"
 
-# ── 一致性哈希 ─────────────────────────────────────────────
+# ── 哈希取模分片 ───────────────────────────────────────────
 def get_owner(key):
-    """根据 key 的哈希值决定由哪个节点负责"""
+    """MD5(key) % 节点数 决定由哪个节点负责（确定性哈希取模，非一致性哈希：
+    节点数变化会导致几乎全部 key 重新映射）"""
     hash_val = int(hashlib.md5(key.encode()).hexdigest(), 16)
     index = hash_val % len(ALL_PORTS)
     return ALL_PORTS[index]

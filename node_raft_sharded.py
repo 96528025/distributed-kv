@@ -2,7 +2,7 @@
 分布式 KV 节点 — 分片 Raft 版（含快照压缩 + 多 key 事务 2PC + 批量写入）
 
 架构：
-- 每个 key 通过一致性哈希分配到某个分片
+- 每个 key 通过哈希取模（MD5(key) % NUM_SHARDS）分配到某个分片
 - 每个分片独立运行一个 Raft 共识组（独立选 Leader、独立日志）
 - 所有节点存全量数据（全量副本）
 - 多个分片的 Leader 可以在不同节点上，写入并行不冲突
@@ -168,7 +168,8 @@ def load_from_disk():
 
 # ── 分片逻辑 ───────────────────────────────────────────────
 def get_shard(key):
-    """根据 key 决定属于哪个分片（一致性哈希）"""
+    """根据 key 决定属于哪个分片（确定性哈希取模，非一致性哈希：
+    NUM_SHARDS 随节点数变化，扩缩容会导致几乎全部 key 重新映射）"""
     return int(hashlib.md5(key.encode()).hexdigest(), 16) % NUM_SHARDS
 
 

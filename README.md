@@ -1,12 +1,14 @@
 # Distributed KV Store / 分布式键值存储引擎
 
-A distributed key-value store built from scratch in Python — evolving from a simple 3-node replicated store all the way to per-shard Raft consensus groups, the architecture used by CockroachDB and TiKV. Deployed across 3 AWS regions.
+[![CI](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml)
 
-Demonstrates core distributed systems concepts: Raft consensus, leader election, log replication, log snapshot compaction, consistent hashing sharding, linearizable reads, two-phase commit (2PC) transactions, batch writes, fault tolerance, and disk persistence.
+A distributed key-value store built from scratch in Python — evolving from a simple 3-node replicated store all the way to per-shard Raft consensus groups, the architecture used by CockroachDB and TiKV. The v1 store and its chat layer were deployed across 3 AWS EC2 regions (Virginia / Oregon / Ireland); v5 supports the same cross-machine `IP:PORT` setup and is verified locally as a 3-node cluster.
 
-用 Python 从零手写的分布式 KV 存储引擎，从最简单的 3 节点同步一路演进到每分片独立 Raft 共识组（CockroachDB / TiKV 的核心架构），部署在 AWS 三大洲。
+Demonstrates core distributed systems concepts: Raft consensus, leader election, log replication, log snapshot compaction, hash-based sharding, linearizable reads, two-phase commit (2PC) transactions, batch writes, fault tolerance, and disk persistence.
 
-涵盖核心分布式系统概念：Raft 共识、选主、日志复制、日志快照压缩、一致性哈希分片、线性化读、两阶段提交（2PC）事务、批量写入、故障容忍、持久化。
+用 Python 从零手写的分布式 KV 存储引擎，从最简单的 3 节点同步一路演进到每分片独立 Raft 共识组（CockroachDB / TiKV 的核心架构）。其中 v1 存储层连同聊天层部署在 AWS 三大洲的 EC2 上（弗吉尼亚 / 俄勒冈 / 爱尔兰）；v5 同样支持跨机器 `IP:PORT` 部署，并以本地三节点集群完整验证。
+
+涵盖核心分布式系统概念：Raft 共识、选主、日志复制、日志快照压缩、哈希取模分片、线性化读、两阶段提交（2PC）事务、批量写入、故障容忍、持久化。
 
 > 附带演示：在 v1 KV store 上构建了一个分布式实时聊天室（WebSocket），验证存储层的可用性。未来计划在更完善的分布式系统上重建聊天室。
 
@@ -183,7 +185,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | File / 文件 | Version | What it does / 功能 |
 |-------------|---------|---------------------|
 | `node.py` | v1 | 最简单版本。Leader = 存活节点中端口最小的（非共识）。写入只有 Leader 接受，同步给其他节点。支持字符串和列表类型，有脑裂演示（/isolate /heal）。**聊天系统用的是这个** |
-| `node_sharded.py` | v2 | 加入一致性哈希分片：`MD5(key) % 3` 决定哪个节点负责哪个 key，每个节点都是自己 key 的 "owner"，写入可以并行。缺陷：节点挂了，它负责的那部分 key 就读不了 |
+| `node_sharded.py` | v2 | 加入哈希取模分片：`MD5(key) % 3` 决定哪个节点负责哪个 key，每个节点都是自己 key 的 "owner"，写入可以并行。缺陷：节点挂了，它负责的那部分 key 就读不了 |
 | `node_raft.py` | v3 | 实现真正的 Raft 共识算法（随机超时选举 + 日志复制 + 心跳 + 任期）。但只有一个全局 Raft group，没有分片，写入还是单点瓶颈 |
 | `node_replicated.py` | v4 | 分片 + 全量副本：每个分片有 primary，所有节点存全量数据，读任意节点都行。缺陷：primary 选举靠简单存活检查，不是 Raft，宕机前未同步的写入会丢 |
 | `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group（CockroachDB / TiKV 的核心架构）。含：日志快照压缩、两阶段提交（2PC）事务、线性化读、批量写入、/delete。当前最完整的版本 |
@@ -286,11 +288,11 @@ Added list type to KV store, built Chat Servers on top, load tested.
 
 ### Day 3 — AWS Cloud Deployment + Sharding + Raft / 第三天：AWS 云端部署 + 分片 + Raft
 
-**Consistent Hashing Sharding (`node_sharded.py`) / 一致性哈希分片**
+**Hash-Based Sharding (`node_sharded.py`) / 哈希取模分片**
 
-Each key is assigned to a node via `MD5(key) % num_nodes`. Writes and reads automatically forwarded to the correct node. No single leader bottleneck — all nodes handle writes in parallel.
+Each key is assigned to a node via `MD5(key) % num_nodes` — deterministic modulo-based sharding, *not* consistent hashing (there is no hash ring and no virtual nodes). Writes and reads automatically forwarded to the correct node. No single leader bottleneck — all nodes handle writes in parallel.
 
-每个 key 通过 `MD5(key) % 节点数` 分配到固定节点。写入和读取自动转发给正确节点，三台都能处理写入，无单点瓶颈。
+每个 key 通过 `MD5(key) % 节点数` 分配到固定节点——这是确定性哈希取模分片，**不是**一致性哈希（没有哈希环，也没有虚拟节点）。写入和读取自动转发给正确节点，三台都能处理写入，无单点瓶颈。
 
 ```
 set user:alice  → hash → node 5001 (direct write)
@@ -323,9 +325,9 @@ Replaces fake "min port = leader" with real consensus:
 
 ### Day 3b — AWS Cloud Deployment / 第三天：AWS 云端部署
 
-Deployed the full stack across 3 AWS EC2 regions.
+Deployed the then-current stack (`node.py` v1 + chat servers) across 3 AWS EC2 regions.
 
-把整个系统部署到 AWS 三大洲的 EC2 上。
+把当时的整套系统（`node.py` v1 + 聊天服务器）部署到 AWS 三大洲的 EC2 上。
 
 **Problems & Solutions / 遇到的问题：**
 
@@ -344,9 +346,9 @@ Deployed the full stack across 3 AWS EC2 regions.
 
 ### Day 4 — Sharding + Full Replication (`node_replicated.py`) / 第四天：分片 + 全量副本
 
-Best of both worlds: consistent hashing sharding (no single write bottleneck) + full replication (every node stores all data, reads from any node).
+Best of both worlds: hash-based sharding (no single write bottleneck) + full replication (every node stores all data, reads from any node).
 
-结合分片和副本的优点：一致性哈希分片（无单点写瓶颈）+ 全量副本（每个节点存所有数据，可从任意节点读）。
+结合分片和副本的优点：哈希取模分片（无单点写瓶颈）+ 全量副本（每个节点存所有数据，可从任意节点读）。
 
 **Architecture / 架构：**
 - 3 shards, each shard has a primary; all nodes store all data / 3个分片，每个分片有primary，所有节点存全量数据
@@ -646,6 +648,7 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 以下局限针对最新版本 `node_raft_sharded.py`。早期版本的局限见上方各 Day 章节。
 
 - **Fixed cluster size** — adding or removing nodes requires a restart; no dynamic membership changes / 节点数固定，无法动态扩缩容
+- **Modulo sharding, not consistent hashing** — keys are placed by `MD5(key) % NUM_SHARDS`, and `NUM_SHARDS` is derived from the node count. Changing the cluster size therefore remaps nearly every key, so this design does *not* have the minimal-remapping property of consistent hashing (no hash ring, no virtual nodes) / 分片用 `MD5(key) % NUM_SHARDS`，而 `NUM_SHARDS` 由节点数决定。改变集群规模会导致几乎所有 key 重新映射，因此不具备一致性哈希的最小重映射特性（没有哈希环，也没有虚拟节点）
 - **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
 - **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口
