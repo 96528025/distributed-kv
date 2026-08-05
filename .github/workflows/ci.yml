@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integration-test:
+    name: 3-node Raft integration test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No pip install: the KV store and its test suite use only the standard library.
+      # This step spins up a real 3-node cluster on localhost:5001-5003 and runs all
+      # 56 integration checks. It is intentionally NOT a lint or syntax check.
+      - name: Run full integration suite (56 checks)
+        run: python3 test_raft_sharded.py
+
+      - name: Clean up stray node processes and test artifacts
+        if: always()
+        run: |
+          pkill -f node_raft_sharded.py || true
+          rm -f data_raft_sharded_*.json snapshot_*.json
