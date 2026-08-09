@@ -159,7 +159,90 @@ class ShardRaft:
 shards = [ShardRaft(i) for i in range(NUM_SHARDS)]
 
 
-# ── 持久化 ─────────────────────────────────────────────────
+# ── Raft hard state 持久化 ─────────────────────────────────
+# Raft 论文 Figure 2 的 persistent state 里，本次只落盘 currentTerm 和 votedFor；
+# Raft log 的持久化是 PR2（见 docs/RAFT_CORRECTNESS.md 的 C3）。
+#
+# 这与 storage WAL 是**两个语义独立的子系统**：
+#   hard state  —— 在回复 RPC / 发出 RequestVote **之前**写，保证不重复投票
+#   storage WAL —— 在 commit **之后**写，保证已提交状态不丢
+HARD_STATE_FILE    = f"raft_hardstate_{MY_PORT}.json"
+HARD_STATE_VERSION = 1
+_hard_state_lock   = threading.Lock()
+
+
+def _fsync_dir(path):
+    """os.replace 之后 fsync 目录项，否则重命名本身可能在掉电后丢失。"""
+    fd = os.open(path or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def persist_hard_state():
+    """把所有分片的 (currentTerm, votedFor) 原子落盘。
+
+    调用约定：
+      - **不能**在持有任何 shard.lock 时调用（本函数内部会逐个短暂获取）；
+      - 必须在任何依赖该状态的 RPC 响应发出**之前**返回。
+
+    写的是全量最新快照（latest-wins）：状态在持锁时读取，磁盘 I/O 在锁外完成。
+    因此并发调用即使乱序完成，也不可能把旧 term 写回去 —— 后写的一定不比先写的旧，
+    而写入一个更新的 term 只会让节点更严格（它不会因此在旧 term 里多投一票）。
+    """
+    with _hard_state_lock:
+        state = {}
+        for shard in shards:
+            with shard.lock:
+                state[str(shard.shard_id)] = {
+                    "term":      shard.term,
+                    "voted_for": shard.voted_for,
+                }
+
+        tmp = HARD_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": HARD_STATE_VERSION, "shards": state}, f)
+            f.flush()
+            os.fsync(f.fileno())      # 必须 fsync：掉电后不能丢掉已经承诺出去的票
+        os.replace(tmp, HARD_STATE_FILE)
+        _fsync_dir(os.path.dirname(os.path.abspath(HARD_STATE_FILE)))
+
+
+def load_hard_state():
+    """启动时恢复 (currentTerm, votedFor)。"""
+    if not os.path.exists(HARD_STATE_FILE):
+        return
+    try:
+        with open(HARD_STATE_FILE) as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        # 写入走 tmp → fsync → os.replace，正式文件不可能是半写的。
+        # 走到这里说明文件真的损坏了 —— 宁可拒绝启动，也不能带着"我没投过票"
+        # 的假状态上线：那等于把 C1 的重复投票问题又放回来一次。
+        raise SystemExit(f"⛔ Raft hard state 损坏，拒绝启动：{HARD_STATE_FILE}（{e}）")
+
+    for sid_str, s in payload.get("shards", {}).items():
+        sid = int(sid_str)
+        if 0 <= sid < NUM_SHARDS:
+            shards[sid].term      = s.get("term", 0)
+            shards[sid].voted_for = s.get("voted_for")
+    restored = {int(k): v["term"] for k, v in payload.get("shards", {}).items()}
+    print(f"  🗳️  恢复 Raft hard state（各分片 currentTerm={restored}）")
+
+
+def _last_log_locked(shard):
+    """返回 (lastLogTerm, lastLogIndex)。调用前必须持有 shard.lock。
+
+    候选人算自己的、投票方算自己的，两边必须用**同一个函数**：日志被快照截空后
+    要退回快照边界，如果一侧忘了这个分支，选举限制就会静默失效。
+    """
+    if shard.log:
+        return shard.log[-1]["term"], shard.log_offset + len(shard.log) - 1
+    return shard.snapshot_term, shard.snapshot_index
+
+
+# ── 状态机持久化 ────────────────────────────────────────────
 def save_to_disk():
     """调用前必须持有 store_lock，且不能持有任何 shard.lock"""
     with open(DISK_FILE, "w") as f:
@@ -363,10 +446,13 @@ def start_election(shard):
         shard.role           = CANDIDATE
         shard.voted_for      = MY_PORT
         shard.votes_received = {MY_PORT}
-        term           = shard.term
-        last_log_index = shard.log_offset + len(shard.log) - 1  # 绝对 index
-        last_log_term  = shard.log[-1]["term"] if shard.log else shard.snapshot_term
-        sid            = shard.shard_id
+        term = shard.term
+        last_log_term, last_log_index = _last_log_locked(shard)
+        sid  = shard.shard_id
+
+    # 先落盘，再拉票。反过来的话：发出 RequestVote 后立刻崩溃 → 重启后忘记自己
+    # 竞选过这个 term → 在同一 term 里既竞选又给别人投票。
+    persist_hard_state()
 
     print(f"\n🗳️  [分片{sid} Term {term}] 节点 {MY_PORT} 发起选举")
 
@@ -381,12 +467,19 @@ def start_election(shard):
             })
             if result is None:
                 return
+
+            stepped_down = False
             with shard.lock:
                 if result.get("term", 0) > shard.term:
                     shard.term      = result["term"]
                     shard.role      = FOLLOWER
                     shard.voted_for = None
-                    return
+                    stepped_down    = True
+            if stepped_down:
+                persist_hard_state()
+                return
+
+            with shard.lock:
                 if (result.get("vote_granted") and
                         shard.role == CANDIDATE and
                         result.get("term") == shard.term):
@@ -435,10 +528,15 @@ def send_heartbeats(shard):
                 "prev_log_term":  pt,            # 该条目的 term（来自快照）
             })
             if result and result.get("term", 0) > t:
+                stepped_down = False
                 with shard.lock:
                     if result["term"] > shard.term:
-                        shard.term = result["term"]
-                        shard.role = FOLLOWER
+                        shard.term      = result["term"]
+                        shard.role      = FOLLOWER
+                        shard.voted_for = None   # 进入新 term = 这个 term 还没投过票
+                        stepped_down    = True
+                if stepped_down:
+                    persist_hard_state()
 
         threading.Thread(target=hb, args=(port, term, entries, ci, lo, snap_term), daemon=True).start()
 
@@ -756,32 +854,65 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(500, {"error": result[0][1] if result[0] else "timeout", "shard": sid})
 
     def _handle_vote(self, body):
-        sid   = body.get("shard_id", 0)
+        sid = body.get("shard_id", 0)
+        if not (0 <= sid < NUM_SHARDS):
+            self._respond(400, {"error": f"unknown shard {sid}", "num_shards": NUM_SHARDS})
+            return
         shard = shards[sid]
 
         candidate_term = body.get("term", 0)
         candidate_id   = body.get("candidate_id")
+        # 候选人**最后一条日志**的 term / index —— 与上面的 candidate_term
+        # （候选人的 currentTerm）是两个不同的东西，混淆这两者会让检查恒真。
+        cand_last_term  = body.get("last_log_term", 0)
+        cand_last_index = body.get("last_log_index", -1)
 
+        dirty = False
         with shard.lock:
             if candidate_term > shard.term:
                 shard.term      = candidate_term
                 shard.role      = FOLLOWER
                 shard.voted_for = None
+                dirty           = True
+
+            # §5.4.1 选举限制：候选人的日志必须至少和我一样新。
+            # 字典序，term 优先：term 更高的候选人即使 index 更小也更新。
+            my_last_term, my_last_index = _last_log_locked(shard)
+            up_to_date = (
+                cand_last_term > my_last_term or
+                (cand_last_term == my_last_term and cand_last_index >= my_last_index)
+            )
 
             vote_granted = (
                 candidate_term >= shard.term and
-                (shard.voted_for is None or shard.voted_for == candidate_id)
+                (shard.voted_for is None or shard.voted_for == candidate_id) and
+                up_to_date
             )
 
             if vote_granted:
                 shard.voted_for      = candidate_id
                 shard.last_heartbeat = time.time()
-                print(f"  🗳️  分片{sid}: 投票给节点 {candidate_id}（Term {candidate_term}）")
+                dirty                = True
+            resp_term = shard.term
 
-            self._respond(200, {"term": shard.term, "vote_granted": vote_granted})
+        # 必须在响应之前落盘：一旦回复了"投票通过"，这张票就不能再被崩溃抹掉。
+        if dirty:
+            persist_hard_state()
+
+        if vote_granted:
+            print(f"  🗳️  分片{sid}: 投票给节点 {candidate_id}（Term {candidate_term}）")
+        elif not up_to_date:
+            print(f"  🚫 分片{sid}: 拒绝 {candidate_id} —— 日志落后"
+                  f"（候选人 last log ({cand_last_term}, {cand_last_index})"
+                  f" < 本节点 ({my_last_term}, {my_last_index})）")
+
+        self._respond(200, {"term": resp_term, "vote_granted": vote_granted})
 
     def _handle_append_entries(self, body):
-        sid        = body.get("shard_id", 0)
+        sid = body.get("shard_id", 0)
+        if not (0 <= sid < NUM_SHARDS):
+            self._respond(400, {"error": f"unknown shard {sid}", "num_shards": NUM_SHARDS})
+            return
         shard      = shards[sid]
         term       = body.get("term", 0)
         lid        = body.get("leader_id")
@@ -794,6 +925,8 @@ class Handler(BaseHTTPRequestHandler):
         snap_leader   = None
         prev_log_index = body.get("prev_log_index", -1)
         prev_log_term  = body.get("prev_log_term", 0)
+        hard_state_dirty = False
+        conflict_resp    = None
 
         with shard.lock:
             if term < shard.term:
@@ -804,6 +937,7 @@ class Handler(BaseHTTPRequestHandler):
             if term > shard.term:
                 shard.term      = term
                 shard.voted_for = None
+                hard_state_dirty = True
 
             shard.role      = FOLLOWER
             shard.leader_id = lid
@@ -820,33 +954,43 @@ class Handler(BaseHTTPRequestHandler):
                             shard.log = shard.log[:rel_i]
                             print(f"  ⚠️  分片{sid}: prevLog 冲突（index={prev_log_index}），"
                                   f"截断至 rel_i={rel_i}")
-                            self._respond(200, {"term": shard.term, "success": False,
-                                               "conflict_index": prev_log_index})
-                            return
+                            conflict_resp = {"term": shard.term, "success": False,
+                                             "conflict_index": prev_log_index}
                     # else: prev entry 超出当前日志，由下方 need_snapshot 逻辑处理
                 # prev_log_index < log_offset：在快照范围内，信任快照 term 一致，跳过
 
-            # 同步日志
-            if entries:
-                if leader_lo > shard.log_offset + len(shard.log):
-                    # 落后太多，需要从 Leader 拉取快照
-                    need_snapshot = True
-                    snap_leader   = lid
-                else:
-                    shard.log        = list(entries)
-                    shard.log_offset = leader_lo
+            if conflict_resp is None:
+                # 同步日志
+                if entries:
+                    if leader_lo > shard.log_offset + len(shard.log):
+                        # 落后太多，需要从 Leader 拉取快照
+                        need_snapshot = True
+                        snap_leader   = lid
+                    else:
+                        shard.log        = list(entries)
+                        shard.log_offset = leader_lo
 
-            # 收集需要 apply 的条目（绝对 index 转换为相对 index）
-            if not need_snapshot and new_commit > shard.commit_index:
-                start_abs = shard.commit_index + 1
-                end_abs   = min(new_commit + 1, len(shard.log) + shard.log_offset)
-                for abs_i in range(start_abs, end_abs):
-                    rel_i = abs_i - shard.log_offset
-                    if 0 <= rel_i < len(shard.log):
-                        to_apply.append(shard.log[rel_i])
-                shard.commit_index = new_commit
+                # 收集需要 apply 的条目（绝对 index 转换为相对 index）
+                if not need_snapshot and new_commit > shard.commit_index:
+                    start_abs = shard.commit_index + 1
+                    end_abs   = min(new_commit + 1, len(shard.log) + shard.log_offset)
+                    for abs_i in range(start_abs, end_abs):
+                        rel_i = abs_i - shard.log_offset
+                        if 0 <= rel_i < len(shard.log):
+                            to_apply.append(shard.log[rel_i])
+                    shard.commit_index = new_commit
 
             resp_term = shard.term
+
+        # 无论走哪条路径，都必须在响应之前把 term/votedFor 落盘。
+        # 冲突分支原来是在锁内直接 return 的 —— 那会绕过持久化，回复一个
+        # 崩溃后就不认账的 term。
+        if hard_state_dirty:
+            persist_hard_state()
+
+        if conflict_resp is not None:
+            self._respond(200, conflict_resp)
+            return
 
         # 在 shard.lock 外执行 I/O
         if need_snapshot:
@@ -1082,6 +1226,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"🚀 分片 Raft 节点启动：port {MY_PORT}")
     print(f"   集群：{ALL_PORTS}，分片数：{NUM_SHARDS}")
+    load_hard_state()   # 必须在任何选举计时器启动之前恢复 currentTerm/votedFor
     load_from_disk()
 
     print(f"\n📊 分片规划（每个分片独立选 Leader）：")

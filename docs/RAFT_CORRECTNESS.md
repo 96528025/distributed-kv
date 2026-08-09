@@ -98,8 +98,24 @@ RPC response that depends on the state is sent. Persist points:
 - incrementing the term when starting an election — persisted *before* the first
   RequestVote leaves the node
 
-The file holds a full latest-wins snapshot of all shards, so concurrent persists that
-complete out of order can never write back an older term.
+The file holds a full latest-wins snapshot of all shards. State is read under
+`shard.lock`; the disk write happens with no shard lock held. Concurrent persists
+that complete out of order therefore cannot write back an older term — and writing a
+*newer* term is always at least as restrictive, so it can never resurrect a spent vote.
+
+Two latent defects surfaced while wiring this up:
+
+- The `prevLog` conflict branch in `_handle_append_entries` returned from inside the
+  lock, which would have skipped persistence entirely — replying with a term the node
+  would disown after a crash. It now falls through to a single exit path.
+- The heartbeat step-down path advanced `currentTerm` **without clearing `votedFor`**.
+  Moving to a new term means the node has not yet voted in it; keeping the old vote
+  would let it refuse a legitimate candidate in the new term. Now cleared.
+
+If the hard state file fails to parse, the node **refuses to start** rather than
+resetting to term 0. Since writes go through `tmp → fsync → os.replace`, the live file
+can never be half-written; a parse failure means real corruption, and booting anyway
+would silently reintroduce exactly the double-vote bug this case fixes.
 
 ### Invariant
 
@@ -189,6 +205,11 @@ up_to_date = (cand_last_term >  my_last_term) or
 helper (`_last_log_locked`) so the two sides cannot drift apart, and so the empty-log
 case falls back to the snapshot boundary identically on both sides.
 
+That fallback is not cosmetic. Once snapshot compaction truncates a shard's log to
+empty, `log[-1]` no longer exists, and the naive reading is "this node has no log" —
+which makes it accept any candidate at all. An empty log after compaction means the
+node's history is *at* the snapshot boundary, not absent. T1.4c pins this down.
+
 ### Invariant
 
 > **I-C2.1** A node grants a vote only if the candidate's `(lastLogTerm, lastLogIndex)`
@@ -204,7 +225,7 @@ almost always, which looks like it works.
 
 ### Regression test
 
-`test_raft_correctness.py` → T1.2, T1.3, T1.4
+`test_raft_correctness.py` → T1.2, T1.3, T1.4a, T1.4b, T1.4c
 
 ---
 
