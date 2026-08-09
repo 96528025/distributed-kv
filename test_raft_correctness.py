@@ -247,6 +247,41 @@ check("T1.9b 不设 override 时默认仍为 len(ALL_PORTS)=3（未偷偷改默�
 node.kill()
 
 
+section("T1.10  分片数与持久化状态不一致时必须拒绝启动  [I-C1.4]")
+
+# RAFT_NUM_SHARDS 是 PR1 自己引入的、生产可达的配置路径。如果换个分片数启动时
+# 静默丢掉超出范围的分片状态，就等于给 I-C1.3 开了一个后门：
+#   3 shards（投过票）→ 1 shard 启动（丢弃 shard 1/2）→ 再回 3 shards
+#   → shard 1/2 的 votedFor 凭空消失 → 同一 term 里可以再投一次
+_cleanup()
+time.sleep(0.3)
+
+node = RealNode(PORT, PEERS, num_shards=3).start()
+r = request_vote(PORT, term=7, candidate_id=9401, last_log_term=0, last_log_index=-1, shard=2)
+d = node.debug(2)
+check("前置：以 3 分片启动并在分片 2 投出一票（term=7, votedFor=9401）",
+      r is not None and r.get("vote_granted") is True
+      and d and d["current_term"] == 7 and d["voted_for"] == 9401,
+      f"resp={r} debug={d}")
+node.kill()
+
+mismatched = RealNode(PORT, PEERS, num_shards=1)
+rc = mismatched.start_expect_exit(timeout=10)
+check("T1.10a 换成 1 分片启动 → 节点拒绝启动（非零退出）",
+      rc is not None and rc != 0,
+      f"exit_code={rc} —— 静默丢弃分片 1/2 的选票会绕开 I-C1.3")
+check("T1.10b 拒绝启动时不对外服务",
+      http_get_status(PORT, "/health", timeout=1) is None,
+      "拒绝启动的节点不应该还在应答请求")
+
+node = RealNode(PORT, PEERS, num_shards=3).start()
+d = node.debug(2)
+check("T1.10c fail-closed 没有破坏原状态：改回 3 分片后选票完好",
+      d and d["current_term"] == 7 and d["voted_for"] == 9401,
+      f"debug={d} —— 拒绝启动必须是只读的，不能顺手改写 hard state")
+node.kill()
+
+
 # ══════════════════════════════════════════════════════════════
 section("测试汇总")
 _cleanup()

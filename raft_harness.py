@@ -165,6 +165,16 @@ class RealNode:
             time.sleep(0.05)
         raise RuntimeError(f"node {self.port} did not become ready in {timeout}s")
 
+    def start_expect_exit(self, timeout=10):
+        """启动一个**预期会拒绝启动**的节点，返回退出码。
+
+        用于 fail-closed 测试：节点必须明确退出，而不是带着残缺状态服务。
+        """
+        self.start(wait=False)
+        rc = self.proc.wait(timeout=timeout)
+        self.proc = None
+        return rc
+
     def kill(self):
         """SIGKILL —— 不给进程任何清理机会。
 

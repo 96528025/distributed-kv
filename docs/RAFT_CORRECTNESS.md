@@ -117,6 +117,21 @@ resetting to term 0. Since writes go through `tmp → fsync → os.replace`, the
 can never be half-written; a parse failure means real corruption, and booting anyway
 would silently reintroduce exactly the double-vote bug this case fixes.
 
+The same fail-closed rule covers shard topology. The file records the `num_shards` it
+was written under, and a mismatch on startup aborts. Without this, the `RAFT_NUM_SHARDS`
+override introduced alongside these tests would be a back door around I-C1.3:
+
+```
+start with 3 shards, vote in shards 1 and 2
+restart with 1 shard   → shards 1 and 2 silently filtered out of the restore
+restart with 3 shards  → shards 1 and 2 are back at term 0, votedFor = None
+                       → the node can vote a second time in a term it already voted in
+```
+
+There is no shard membership or migration semantics in this implementation, so refusing
+to start is the only correct behaviour. The abort is read-only: it must not rewrite the
+hard state on its way out (asserted by T1.10c).
+
 ### Invariant
 
 > **I-C1.1** If a node has replied `vote_granted = true` for `(shard, term, candidate)`,
@@ -127,7 +142,12 @@ would silently reintroduce exactly the double-vote bug this case fixes.
 > **I-C1.3** For a given `(shard, term)`, a node grants at most one distinct
 > `candidate_id`, across any number of crashes.
 >
-> 一个节点回复"投票通过"之前，这张票已经落盘；重启后 term 不回退；同一 term 只投一次。
+> **I-C1.4** Persisted hard state is only ever restored under the shard topology it
+> was written under. A shard-count change fails startup rather than discarding the
+> election state of shards that fall outside the new range.
+>
+> 一个节点回复"投票通过"之前，这张票已经落盘；重启后 term 不回退；同一 term 只投一次；
+> 分片拓扑变了就拒绝启动，而不是丢掉一部分选票。
 
 **I-C1.1 is tested against SIGKILL, which proves the write reached the OS (flush),
 not that it reached the platter (fsync).** The code does call `fsync`; the test does
@@ -136,7 +156,17 @@ same distinction the storage WAL already documents.
 
 ### Regression test
 
-`test_raft_correctness.py` → T1.1, T1.5, T1.6, T1.7
+`test_raft_correctness.py` → T1.1, T1.5, T1.6, T1.7, T1.10
+
+### Documented follow-ups (not blocking)
+
+- `persist_hard_state()` atomically rewrites **all** shards on every mutation. That is
+  O(N) write amplification per change and O(N²) across a term-churn storm. Invisible at
+  N=3 and correct as written, but **PR2's per-shard durable journal must not inherit
+  this strategy.** The intended evolution is: PR1 correctness-first whole-file atomic
+  persistence → PR2 per-shard append journal.
+- `_fsync_dir` is POSIX-oriented (`os.open(dir, O_RDONLY)` + `fsync`). Linux CI and
+  macOS development cover the supported surface; no Windows abstraction is planned.
 
 ### Note: what C1 does *not* establish
 

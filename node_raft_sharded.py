@@ -202,7 +202,11 @@ def persist_hard_state():
 
         tmp = HARD_STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"version": HARD_STATE_VERSION, "shards": state}, f)
+            # num_shards 是这份状态的**拓扑身份**：分片数变了，同一个 sid 就不再
+            # 指同一个 Raft group，这份 term/vote 也就不再适用。见 load_hard_state。
+            json.dump({"version":    HARD_STATE_VERSION,
+                       "num_shards": NUM_SHARDS,
+                       "shards":     state}, f)
             f.flush()
             os.fsync(f.fileno())      # 必须 fsync：掉电后不能丢掉已经承诺出去的票
         os.replace(tmp, HARD_STATE_FILE)
@@ -222,12 +226,32 @@ def load_hard_state():
         # 的假状态上线：那等于把 C1 的重复投票问题又放回来一次。
         raise SystemExit(f"⛔ Raft hard state 损坏，拒绝启动：{HARD_STATE_FILE}（{e}）")
 
+    # ── 分片拓扑身份检查（fail closed）──────────────────────
+    # 分片数变化时静默过滤掉超出范围的分片，会直接绕开 C1 刚建立的
+    # "durable、单调的 term/vote"：3 → 1 → 3 之后，分片 1、2 的票凭空消失，
+    # 节点可以在自己已经投过票的 term 里再投一次。
+    # 当前实现还没有 shard membership / 迁移语义，所以这里唯一正确的行为是拒绝启动。
+    persisted_n = payload.get("num_shards")
+    if persisted_n != NUM_SHARDS:
+        raise SystemExit(
+            f"⛔ Raft 分片拓扑与持久化状态不一致，拒绝启动：\n"
+            f"   {HARD_STATE_FILE} 记录 num_shards={persisted_n}，"
+            f"本次启动配置 NUM_SHARDS={NUM_SHARDS}\n"
+            f"   丢弃任何一个分片的 term/votedFor 都会让该分片可以在同一 term 内重复投票。\n"
+            f"   本实现没有分片迁移语义；要改分片数请先清理该节点的 Raft 状态。"
+        )
+
+    restored = {}
     for sid_str, s in payload.get("shards", {}).items():
         sid = int(sid_str)
-        if 0 <= sid < NUM_SHARDS:
-            shards[sid].term      = s.get("term", 0)
-            shards[sid].voted_for = s.get("voted_for")
-    restored = {int(k): v["term"] for k, v in payload.get("shards", {}).items()}
+        if not (0 <= sid < NUM_SHARDS):
+            raise SystemExit(
+                f"⛔ Raft hard state 含越界分片 {sid}（num_shards={NUM_SHARDS}），拒绝启动："
+                f"{HARD_STATE_FILE}"
+            )
+        shards[sid].term      = s.get("term", 0)
+        shards[sid].voted_for = s.get("voted_for")
+        restored[sid]         = s.get("term", 0)
     print(f"  🗳️  恢复 Raft hard state（各分片 currentTerm={restored}）")
 
 
