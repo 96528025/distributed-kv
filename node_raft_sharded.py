@@ -41,14 +41,35 @@ for arg in sys.argv[2:]:
         PEER_MAP[int(arg)] = "localhost"
 PEER_PORTS = list(PEER_MAP.keys())
 ALL_PORTS  = sorted([MY_PORT] + PEER_PORTS)
-NUM_SHARDS = len(ALL_PORTS)
 DISK_FILE  = f"data_raft_sharded_{MY_PORT}.json"
+
+# ── 测试模式 ────────────────────────────────────────────────
+# RAFT_TEST_MODE=1 才开放内省端点和计时器 override。生产默认全部关闭：
+# /debug/raft 会 dump 整个 Raft 内部状态，不应该是一个无条件公开的 API。
+TEST_MODE = os.environ.get("RAFT_TEST_MODE") == "1"
+
+# 分片数默认仍然绑定节点数（这是已知局限，见 README「Known limitations」）。
+# 这里只提供一个显式覆盖口，让测试可以把集群压成单个 Raft group 来推理；
+# 不改变默认行为，也不是 shard placement 重构的开始。
+# ⚠️ 该值必须在集群所有节点上一致，否则同一个 key 会被路由到不同分片。
+NUM_SHARDS = int(os.environ.get("RAFT_NUM_SHARDS") or len(ALL_PORTS))
 
 FOLLOWER  = "follower"
 CANDIDATE = "candidate"
 LEADER    = "leader"
 
 HEARTBEAT_INTERVAL = 0.5
+
+# 选举超时区间。只有 TEST_MODE 下才允许 override —— 测试需要确定性地让某个节点
+# 先超时（或永不超时），但生产环境不应该能从环境变量调乱选举计时。
+ELECTION_TIMEOUT_MIN = 1.5
+ELECTION_TIMEOUT_MAX = 3.0
+if TEST_MODE:
+    ELECTION_TIMEOUT_MIN = float(os.environ.get("RAFT_ELECTION_TIMEOUT_MIN", ELECTION_TIMEOUT_MIN))
+    ELECTION_TIMEOUT_MAX = float(os.environ.get("RAFT_ELECTION_TIMEOUT_MAX", ELECTION_TIMEOUT_MAX))
+
+def new_election_timeout():
+    return random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
 SNAPSHOT_THRESHOLD = 20   # log 超过 20 条就触发快照（小值方便演示）
 BATCH_MAX_SIZE     = 20   # 每批最多合并 20 条写请求
 BATCH_TIMEOUT      = 0.005  # 最长等待 5ms 积攒批次
@@ -122,7 +143,7 @@ class ShardRaft:
 
         # 选举计时
         self.last_heartbeat   = time.time()
-        self.election_timeout = random.uniform(1.5, 3.0)
+        self.election_timeout = new_election_timeout()
 
         # 2PC 事务字段
         self.pending_txns = {}   # {txn_id: [{"key": ..., "value": ...}]}
@@ -445,7 +466,7 @@ def election_timer():
 
             if not is_leader and elapsed > timeout:
                 with shard.lock:
-                    shard.election_timeout = random.uniform(1.5, 3.0)
+                    shard.election_timeout = new_election_timeout()
                 start_election(shard)
 
 
@@ -508,6 +529,46 @@ class Handler(BaseHTTPRequestHandler):
                         "pending_txns":   len(shard.pending_txns),
                     }
             self._respond(200, {"node": MY_PORT, "shards": shard_info})
+
+        elif self.path.startswith("/debug/raft"):
+            # 只在 TEST_MODE 下开放：会把 Raft 内部状态（含完整日志）全量 dump 出来。
+            if not TEST_MODE:
+                self._respond(404, {"error": "unknown endpoint"})
+                return
+
+            sid = None
+            if "?" in self.path:
+                query = self.path.split("?", 1)[1]
+                for pair in query.split("&"):
+                    if pair.startswith("shard="):
+                        try:
+                            sid = int(pair.split("=", 1)[1])
+                        except ValueError:
+                            self._respond(400, {"error": "shard must be an integer"})
+                            return
+            if sid is not None and not (0 <= sid < NUM_SHARDS):
+                self._respond(404, {"error": f"no such shard {sid}", "num_shards": NUM_SHARDS})
+                return
+
+            targets = shards if sid is None else [shards[sid]]
+            out = {}
+            for shard in targets:
+                with shard.lock:
+                    out[shard.shard_id] = {
+                        "role":           shard.role,
+                        # Raft 论文里的 persistent state
+                        "current_term":   shard.term,
+                        "voted_for":      shard.voted_for,
+                        "log":            list(shard.log),
+                        "log_offset":     shard.log_offset,
+                        # volatile state
+                        "commit_index":   shard.commit_index,
+                        "leader_id":      shard.leader_id,
+                        "snapshot_index": shard.snapshot_index,
+                        "snapshot_term":  shard.snapshot_term,
+                        # last_applied 在 PR4 引入；next_index/match_index 在 PR3 引入
+                    }
+            self._respond(200, {"node": MY_PORT, "num_shards": NUM_SHARDS, "shards": out})
 
         else:
             self._respond(404, {"error": "unknown endpoint"})
