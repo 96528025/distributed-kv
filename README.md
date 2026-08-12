@@ -60,6 +60,70 @@ Prepare follows `not_leader` hints or tries other known nodes when the cached Le
 
 ---
 
+## Persistence: WAL + Checkpoint / 持久化：WAL + Checkpoint
+
+The legacy JSON full-store rewrite remains the default for backward compatibility. The
+new WAL backend is explicit opt-in with `--backend=wal`.
+
+旧版 JSON 全量重写仍是默认 backend，保证现有数据格式与 `56/56` 测试路径兼容；WAL
+必须通过 `--backend=wal` 显式开启。
+
+Only operations that have reached a Raft majority and are being applied to the state
+machine enter the storage WAL. This includes committed set, delete, batch entries,
+transaction commits, follower apply, and installed snapshot state. Uncommitted in-memory
+or Raft-log entries are never replayed as state-machine data.
+
+WAL records use a framed format:
+
+```text
+MAGIC(4) | payload length(4) | versioned JSON payload | crc32(4)
+payload = shard id + absolute applied index + term + op + key + value
+```
+
+Recovery loads the latest valid checkpoint, then replays only records whose per-shard
+index is newer than the checkpoint's `applied` index. Replay is idempotent. A partial final
+frame is discarded and the bad tail is truncated before future appends; checksum, frame
+alignment, or checkpoint corruption raises an explicit `StorageCorruptionError`.
+
+Checkpoint publication follows this crash-safe order:
+
+1. Write the full state plus per-shard applied indexes to a temporary file.
+2. `flush()` and `fsync()` the temporary file.
+3. Publish it with atomic `os.replace()` and fsync the directory where supported.
+4. Only after publication succeeds, truncate/rotate the WAL.
+
+The Raft snapshot and storage checkpoint remain separate mechanisms:
+
+| Mechanism | Responsibility | State-machine authority with WAL enabled |
+|---|---|---|
+| Raft snapshot | Raft log compaction and follower catch-up metadata | Does not overwrite newer storage-WAL values during startup |
+| Storage checkpoint + WAL | Single-node committed state-machine crash recovery | Restores store plus per-shard applied indexes |
+
+By default each committed WAL batch is flushed to the OS page cache, which is tested with
+`SIGKILL`. Use `--fsync` (or `KV_FSYNC=1`) to request an fsync per commit for stronger
+power-loss durability; checkpoints are always fsynced.
+
+```bash
+# Default: legacy JSON backend
+python3 node_raft_sharded.py 5001 5002 5003
+
+# WAL backend
+python3 node_raft_sharded.py 5001 5002 5003 --backend=wal
+
+# Optional configuration (CLI overrides environment)
+--data-dir=PATH        # KV_DATA_DIR
+--fsync                # KV_FSYNC=1
+--rotate-records=1000  # KV_ROTATE_RECORDS
+```
+
+`python3 test_wal.py` currently reports `17/17`, including set/delete/batch/transaction
+recovery, committed-only replay, checksum and checkpoint corruption, repaired partial
+tails, rotation, JSON compatibility, and a real three-node cluster surviving two complete
+`SIGKILL` cycles. Storage microbenchmark methodology and preserved raw results are in
+[`benchmarks/storage_benchmark.md`](benchmarks/storage_benchmark.md).
+
+---
+
 ## Architecture / 架构
 
 ### Chat System (v1 KV + chat servers) / 聊天系统架构
@@ -114,6 +178,7 @@ Prepare follows `not_leader` hints or tries other known nodes when the cached Le
 - Quorum-validated Leader reads reject isolated old Leaders; not yet a complete ReadIndex implementation / Leader 本地读前确认多数派，隔离旧 Leader 会拒绝读取；尚非完整 ReadIndex
 - Multi-key transactions via 2PC (v5) — atomically write across shards / 跨分片原子事务（v5）
 - Transaction prepare follows Leader changes and records the actual participant for commit/abort / prepare 阶段跟随 Leader 变化，commit/abort 发往实际 participant
+- Optional append-only WAL + atomic checkpoint backend; legacy JSON remains default / 可选 WAL + 原子 checkpoint，默认仍为兼容 JSON backend
 - Batch writes (v5) — concurrent requests merged into one Raft round / 批量写入，并发请求合并（v5）
 - List type — `lpush` / `lrange` for storing message history (v1/v2) / 列表类型，用于存储聊天历史（v1/v2）
 - Split-brain demo — simulate network partition with `isolate`/`heal` (v1) / 脑裂演示（v1）
@@ -172,6 +237,10 @@ sleep 5
 python3 test_raft_sharded.py
 python3 test_read_quorum.py
 python3 test_txn_routing.py
+python3 test_wal.py
+
+# Storage benchmark smoke test / 存储基准冒烟
+python3 benchmark_storage.py --quick --no-save
 ```
 
 ### Cloud (AWS) / 云端运行
@@ -212,7 +281,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `node_sharded.py` | v2 | 加入哈希取模分片：`MD5(key) % 3` 决定哪个节点负责哪个 key，每个节点都是自己 key 的 "owner"，写入可以并行。缺陷：节点挂了，它负责的那部分 key 就读不了 |
 | `node_raft.py` | v3 | 实现真正的 Raft 共识算法（随机超时选举 + 日志复制 + 心跳 + 任期）。但只有一个全局 Raft group，没有分片，写入还是单点瓶颈 |
 | `node_replicated.py` | v4 | 分片 + 全量副本：每个分片有 primary，所有节点存全量数据，读任意节点都行。缺陷：primary 选举靠简单存活检查，不是 Raft，宕机前未同步的写入会丢 |
-| `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group。含：日志快照压缩、两阶段提交（2PC）事务、quorum-validated Leader reads、批量写入、/delete。当前最完整的版本 |
+| `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group。含：日志快照压缩、两阶段提交（2PC）事务、quorum-validated Leader reads、批量写入、/delete，以及可选 WAL backend。当前最完整的版本 |
 
 ### Chat System / 聊天系统
 
@@ -230,6 +299,9 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `test_raft_sharded.py` | v5 的全自动测试套件（56 个 runtime checks，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、Leader-routed reads、批量写入 |
 | `test_read_quorum.py` | 3 个 read-quorum logic tests + 1 个 live failure-injection regression；验证隔离旧 Leader 拒绝 stale read |
 | `test_txn_routing.py` | 5 个 focused tests；覆盖 Leader hint、不可达 fallback、锁冲突、相同 txn_id 与实际 phase-2 participant |
+| `storage.py` | `StorageEngine` abstraction、legacy JSON backend、append-only WAL、checksum replay 与 atomic checkpoint |
+| `test_wal.py` | 17 项 WAL/checkpoint 检查，含真实三节点两次 SIGKILL 恢复与 post-restart index continuity |
+| `benchmark_storage.py` | JSON 全量重写与 WAL append 的存储层 microbenchmark；结果见 `benchmarks/storage_benchmark.md` |
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only read 与 quorum-validated Leader read 的区别、故障场景和 ReadIndex 边界 |
 | `docs/LESSON_02_TXN_LEADER_CHANGES.md` | prepare 可安全 discovery 的边界，以及 phase-2 仍需 durable recovery 的原因 |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
@@ -685,4 +757,7 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 - **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
 - **2PC phase-2 recovery is not durable** — routing commit/abort to the in-memory prepare participant does not recover a decision after a participant or coordinator crash / phase 2 会发往内存中的实际 participant，但 participant 或 coordinator 崩溃后的 decision 尚不可恢复
 - **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
+- **WAL is opt-in and fsync-per-commit is off by default** — default JSON behavior is preserved; WAL `flush()` covers tested process crashes, while power-loss durability requires `--fsync` / WAL 需显式开启，默认每次 commit 不 fsync；进程强杀已验证，掉电级持久需 `--fsync`
+- **Checkpoint pauses local writes briefly** — rotation writes one O(N) full-state checkpoint while holding `store_lock`; the threshold trades write amplification against replay length / checkpoint 轮换会短暂阻塞本节点写入，阈值用于权衡写放大与恢复 replay 长度
+- **Storage durability does not complete Raft durability** — term, vote, and full Raft log recovery remain separate unfinished work / storage WAL 不等于完整 Raft 持久化，term、vote 与完整 Raft log 恢复仍是独立未完成项
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口
