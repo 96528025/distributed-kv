@@ -1,5 +1,9 @@
 data_*.json
 snapshot_*.json
+# WAL backend runtime state
+wal_*.log
+checkpoint_*.json
+checkpoint_*.json.tmp
 __pycache__/
 *.pyc
 venv/
