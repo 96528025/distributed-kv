@@ -11,7 +11,8 @@
   1. 日志快照压缩：日志超过 SNAPSHOT_THRESHOLD 条时自动生成快照，截断旧日志
   2. 多 key 事务（2PC）：原子地修改多个 key，使用两阶段提交保证一致性
   3. 删除操作（/delete）：通过 Raft 共识删除 key，所有节点同步
-  4. 线性化读（/get 路由到 Leader）：读请求转发给分片 Leader，保证读到最新已提交数据
+  4. Quorum-validated Leader 读：/get 转发到分片 Leader，Leader 读前确认仍可联系多数派
+     （阻止失去 quorum 的旧 Leader 返回陈旧值；完整 linearizability 仍依赖正确 Raft）
   5. 批量写入（Batching）：每个分片有独立 batch_loop，积攒多个写请求合并成一次
      Raft round，大幅提高高并发下的吞吐量
 """
@@ -52,6 +53,7 @@ HEARTBEAT_INTERVAL = 0.5
 SNAPSHOT_THRESHOLD = 20   # log 超过 20 条就触发快照（小值方便演示）
 BATCH_MAX_SIZE     = 20   # 每批最多合并 20 条写请求
 BATCH_TIMEOUT      = 0.005  # 最长等待 5ms 积攒批次
+READ_QUORUM_TIMEOUT = 0.5   # Leader 读前确认多数派的最长等待时间
 
 
 # ── 全局 KV 状态机（所有分片共用）────────────────────────
@@ -433,6 +435,82 @@ def heartbeat_loop():
                 threading.Thread(target=send_heartbeats, args=(shard,), daemon=True).start()
 
 
+def confirm_read_quorum(shard, timeout=READ_QUORUM_TIMEOUT):
+    """确认当前节点仍是得到多数派承认的 Leader。
+
+    使用当前 term 的 AppendEntries probe 联系 peers；没有同 term quorum 时拒绝
+    本地读。如果任何 peer 返回更高 term，当前节点立即更新 term 并退回 Follower。
+
+    这是防止隔离旧 Leader 返回 stale value 的 read barrier，不是完整的 Raft
+    ReadIndex；完整 linearizability 还依赖选举、日志匹配和 apply 等 Raft invariants。
+    """
+    with shard.lock:
+        if shard.role != LEADER:
+            return False
+        term      = shard.term
+        ci        = shard.commit_index
+        entries   = list(shard.log)
+        lo        = shard.log_offset
+        snap_term = shard.snapshot_term
+        sid       = shard.shard_id
+
+    if majority() == 1:
+        return True
+
+    responses = []
+    response_lock = threading.Lock()
+
+    def probe(port):
+        result = send_rpc(port, "/append_entries", {
+            "shard_id":       sid,
+            "term":           term,
+            "leader_id":      MY_PORT,
+            "entries":        entries,
+            "commit_index":   ci,
+            "log_offset":     lo,
+            "prev_log_index": lo - 1,
+            "prev_log_term":  snap_term,
+        }, timeout=timeout)
+        with response_lock:
+            responses.append(result)
+
+    threads = [
+        threading.Thread(target=probe, args=(port,), daemon=True)
+        for port in PEER_PORTS
+    ]
+    for thread in threads:
+        thread.start()
+
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+
+    with response_lock:
+        peer_responses = list(responses)
+
+    higher_term = max(
+        (result.get("term", 0) for result in peer_responses if result),
+        default=term,
+    )
+    with shard.lock:
+        if higher_term > shard.term:
+            shard.term      = higher_term
+            shard.role      = FOLLOWER
+            shard.voted_for = None
+            shard.leader_id = None
+        if shard.role != LEADER or shard.term != term:
+            return False
+
+    acknowledgements = 1 + sum(
+        1 for result in peer_responses
+        if result and result.get("success") and result.get("term") == term
+    )
+    return acknowledgements >= majority()
+
+
 def election_timer():
     """遍历所有分片，超时则发起选举"""
     while True:
@@ -462,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
                 role   = shard.role
                 leader = shard.leader_id
 
-            # 非 Leader → 转发给 Leader（线性化读，保证读到最新提交）
+            # 非 Leader → 转发给当前已知 Leader；最终由 Leader 执行 quorum barrier。
             if role != LEADER:
                 if leader is not None:
                     result = send_get_rpc(leader, f"/get?key={key}")
@@ -475,7 +553,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._respond(503, {"error": "no leader yet for shard", "shard": sid})
                 return
 
-            # 是 Leader → 直接读（保证看到所有已提交数据）
+            # Leader-only routing 不足以排除隔离旧 Leader；本地读前必须确认 quorum。
+            if not confirm_read_quorum(shard):
+                self._respond(503, {
+                    "error": "leadership quorum unavailable",
+                    "shard": sid,
+                    "retryable": True,
+                })
+                return
+
             with store_lock:
                 value = store.get(key)
             if value is None:

@@ -4,11 +4,11 @@
 
 A distributed key-value store built from scratch in Python — evolving from a simple 3-node replicated store all the way to per-shard Raft consensus groups, the architecture used by CockroachDB and TiKV. The v1 store and its chat layer were deployed across 3 AWS EC2 regions (Virginia / Oregon / Ireland); v5 supports the same cross-machine `IP:PORT` setup and is verified locally as a 3-node cluster.
 
-Demonstrates core distributed systems concepts: Raft consensus, leader election, log replication, log snapshot compaction, hash-based sharding, linearizable reads, two-phase commit (2PC) transactions, batch writes, fault tolerance, and disk persistence.
+Demonstrates core distributed systems concepts: Raft consensus, leader election, log replication, log snapshot compaction, hash-based sharding, quorum-validated Leader reads, two-phase commit (2PC) transactions, batch writes, fault tolerance, and disk persistence.
 
 用 Python 从零手写的分布式 KV 存储引擎，从最简单的 3 节点同步一路演进到每分片独立 Raft 共识组（CockroachDB / TiKV 的核心架构）。其中 v1 存储层连同聊天层部署在 AWS 三大洲的 EC2 上（弗吉尼亚 / 俄勒冈 / 爱尔兰）；v5 同样支持跨机器 `IP:PORT` 部署，并以本地三节点集群完整验证。
 
-涵盖核心分布式系统概念：Raft 共识、选主、日志复制、日志快照压缩、哈希取模分片、线性化读、两阶段提交（2PC）事务、批量写入、故障容忍、持久化。
+涵盖核心分布式系统概念：Raft 共识、选主、日志复制、日志快照压缩、哈希取模分片、Leader 读前多数派确认、两阶段提交（2PC）事务、批量写入、故障容忍、持久化。
 
 > 附带演示：在 v1 KV store 上构建了一个分布式实时聊天室（WebSocket），验证存储层的可用性。未来计划在更完善的分布式系统上重建聊天室。
 
@@ -28,7 +28,7 @@ $ python3 test_raft_sharded.py
   ✅ PASS  节点重启后从快照恢复，数据不丢
   ✅ PASS  Follower 落后拉快照（install_snapshot）
   ✅ PASS  多 key 事务提交 / 锁冲突 abort / 锁超时自动释放
-  ✅ PASS  线性化读（Leader 直读，Follower 转发）
+  ✅ PASS  Leader-routed read 正常路径（Follower 转发）
   ✅ PASS  10 并发写入 + 5 并发删除全部成功
   ...
 ───────────────────────────────────────────────────────
@@ -36,7 +36,17 @@ $ python3 test_raft_sharded.py
 ───────────────────────────────────────────────────────
 ```
 
-Covers leader election, log replication, snapshot compaction & recovery, `install_snapshot` catch-up, 2PC multi-key transactions (commit / lock-conflict abort / lock-timeout release), linearizable reads, and concurrent batch writes/deletes.
+Covers leader election, log replication, snapshot compaction & recovery, `install_snapshot` catch-up, 2PC multi-key transactions (commit / lock-conflict abort / lock-timeout release), Leader-routed reads, and concurrent batch writes/deletes.
+
+The focused read-quorum suite adds three logic tests plus a real three-process failure-injection test:
+
+```console
+$ python3 test_read_quorum.py
+Ran 4 tests
+OK
+```
+
+It verifies that an isolated old Leader rejects a read without quorum and converges to the majority's committed value after communication resumes. This closes the stale-old-Leader path; it is not a complete Raft ReadIndex proof.
 
 ---
 
@@ -77,7 +87,7 @@ Covers leader election, log replication, snapshot compaction & recovery, `instal
 分片 1: Raft Group → Leader 可能在不同节点
 分片 2: Raft Group → Leader 可能在不同节点
 
-所有节点存全量数据，写入路由到对应分片的 Leader，读取路由到 Leader（线性化读）
+所有节点存全量数据；写入路由到对应分片的 Leader，读取路由到 Leader，并在本地读前确认多数派
 ```
 
 ---
@@ -91,6 +101,7 @@ Covers leader election, log replication, snapshot compaction & recovery, `instal
 - Log snapshot compaction (v5) — log truncated after threshold; restart restores from local snapshot file / 日志超过阈值自动压缩，重启从本地快照恢复
 - Raft consensus leader election (v5) / simple min-port election (v1) / Raft 共识选主（v5）/最小端口当 Leader（v1）
 - Auto redirect — non-leader automatically forwards writes/reads to shard leader / 非 Leader 自动转发请求到分片 Leader
+- Quorum-validated Leader reads reject isolated old Leaders; not yet a complete ReadIndex implementation / Leader 本地读前确认多数派，隔离旧 Leader 会拒绝读取；尚非完整 ReadIndex
 - Multi-key transactions via 2PC (v5) — atomically write across shards / 跨分片原子事务（v5）
 - Batch writes (v5) — concurrent requests merged into one Raft round / 批量写入，并发请求合并（v5）
 - List type — `lpush` / `lrange` for storing message history (v1/v2) / 列表类型，用于存储聊天历史（v1/v2）
@@ -148,6 +159,7 @@ sleep 5
 
 # 运行自动化测试 / Run automated tests
 python3 test_raft_sharded.py
+python3 test_read_quorum.py
 ```
 
 ### Cloud (AWS) / 云端运行
@@ -188,7 +200,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `node_sharded.py` | v2 | 加入哈希取模分片：`MD5(key) % 3` 决定哪个节点负责哪个 key，每个节点都是自己 key 的 "owner"，写入可以并行。缺陷：节点挂了，它负责的那部分 key 就读不了 |
 | `node_raft.py` | v3 | 实现真正的 Raft 共识算法（随机超时选举 + 日志复制 + 心跳 + 任期）。但只有一个全局 Raft group，没有分片，写入还是单点瓶颈 |
 | `node_replicated.py` | v4 | 分片 + 全量副本：每个分片有 primary，所有节点存全量数据，读任意节点都行。缺陷：primary 选举靠简单存活检查，不是 Raft，宕机前未同步的写入会丢 |
-| `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group（CockroachDB / TiKV 的核心架构）。含：日志快照压缩、两阶段提交（2PC）事务、线性化读、批量写入、/delete。当前最完整的版本 |
+| `node_raft_sharded.py` | **v5** | 每个分片独立运行一个 Raft group。含：日志快照压缩、两阶段提交（2PC）事务、quorum-validated Leader reads、批量写入、/delete。当前最完整的版本 |
 
 ### Chat System / 聊天系统
 
@@ -203,7 +215,9 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | File / 文件 | What it does / 功能 |
 |-------------|---------------------|
 | `client.py` | 交互式命令行客户端，手动操作 v1 KV store（get / set / lpush / lrange 等） |
-| `test_raft_sharded.py` | v5 的全自动测试套件（56 个用例，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、线性化读、批量写入 |
+| `test_raft_sharded.py` | v5 的全自动测试套件（56 个 runtime checks，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、Leader-routed reads、批量写入 |
+| `test_read_quorum.py` | 3 个 read-quorum logic tests + 1 个 live failure-injection regression；验证隔离旧 Leader 拒绝 stale read |
+| `docs/LESSON_01_READ_QUORUM.md` | Leader-only read 与 quorum-validated Leader read 的区别、故障场景和 ReadIndex 边界 |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
 | `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
@@ -215,7 +229,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/get?key=<k>` | read a value — routes to shard leader (linearizable) / 线性化读，路由到分片 Leader |
+| GET | `/get?key=<k>` | route to shard Leader and confirm quorum before local read; not yet full ReadIndex / 路由到 Leader 并在本地读前确认多数派，尚非完整 ReadIndex |
 | GET | `/all` | dump all data / 查看所有数据 |
 | GET | `/health` | per-shard Raft state (role, term, leader, log_length...) / 各分片 Raft 状态 |
 | POST | `/set` | write a key-value pair (batched, Raft-replicated) / 写入（批量合并，Raft 复制） |
@@ -532,7 +546,7 @@ The single-threaded HTTPServer deadlock only manifests when the coordinator and 
 
 ---
 
-### Day 5c — Delete + Linearizable Reads + Raft Correctness / 第五天 c：删除 + 线性化读 + Raft 正确性
+### Day 5c — Delete + Leader Reads + Raft Hardening / 第五天 c：删除、Leader 读与 Raft 改进
 
 Four improvements added to `node_raft_sharded.py`, bringing total automated tests to 50.
 
@@ -548,15 +562,17 @@ Deletes a key via Raft consensus — the delete operation goes through the same 
 - Non-leader auto-forwards with `forwarded_by` field / 非 Leader 自动转发，响应包含 `forwarded_by`
 - `apply_entry(entry)` handles both `op="set"` and `op="delete"` / 统一 apply 函数处理两种操作
 
-**Feature 2: Linearizable Reads / 线性化读**
+**Feature 2: Quorum-validated Leader Reads / 多数派确认的 Leader 读**
 
-Previously any node could serve reads from local state — a follower that was slightly behind could return stale data. Now `/get` routes to the shard Leader, which always has the latest committed state.
+Previously any node could serve reads from local state. `/get` first routes to the shard Leader. The Leader must then contact a same-term quorum before reading locally, so an isolated old Leader rejects the request instead of returning stale state.
 
-之前任意节点都从本地状态读，Follower 落后时会返回旧值。现在 `/get` 路由到分片 Leader，保证读到最新已提交的数据。
+之前任意节点都从本地状态读。现在 `/get` 先路由到分片 Leader，Leader 再确认能够联系同 term 多数派；失去 quorum 的旧 Leader 会拒绝请求，而不是返回本地旧值。
 
-- Leader serves directly from local store / Leader 直接从本地读
+- Leader confirms quorum before reading local state / Leader 本地读前确认多数派
 - Non-leader forwards via HTTP and adds `forwarded_by` to the response / 非 Leader 转发，响应含 `forwarded_by`
-- Write then immediately read from any node → always returns the latest value / 写完立刻从任意节点读都能拿到最新值
+- A higher-term peer response updates the term and forces the old Leader to step down / peer 返回更高 term 时更新任期并退位
+- `test_read_quorum.py` verifies both logic and the isolated-old-Leader failure path / 单元测试与真实三进程故障注入共同覆盖
+- This barrier is distinct from Leader-only routing and is not yet a complete ReadIndex proof / 此 barrier 不同于仅路由到 Leader，且尚非完整 ReadIndex
 
 **Feature 3: prevLogIndex / prevLogTerm Consistency Check / 日志一致性检查**
 
@@ -649,6 +665,7 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 
 - **Fixed cluster size** — adding or removing nodes requires a restart; no dynamic membership changes / 节点数固定，无法动态扩缩容
 - **Modulo sharding, not consistent hashing** — keys are placed by `MD5(key) % NUM_SHARDS`, and `NUM_SHARDS` is derived from the node count. Changing the cluster size therefore remaps nearly every key, so this design does *not* have the minimal-remapping property of consistent hashing (no hash ring, no virtual nodes) / 分片用 `MD5(key) % NUM_SHARDS`，而 `NUM_SHARDS` 由节点数决定。改变集群规模会导致几乎所有 key 重新映射，因此不具备一致性哈希的最小重映射特性（没有哈希环，也没有虚拟节点）
+- **Read barrier is not full ReadIndex** — it rejects an isolated old Leader, but complete linearizability still depends on the remaining Raft election, log, commit/apply, and durability invariants / read quorum 阻止隔离旧 Leader 读旧值，但完整线性一致性仍依赖尚未完成的 Raft invariants
 - **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
 - **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口
