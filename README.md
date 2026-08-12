@@ -48,6 +48,16 @@ OK
 
 It verifies that an isolated old Leader rejects a read without quorum and converges to the majority's committed value after communication resumes. This closes the stale-old-Leader path; it is not a complete Raft ReadIndex proof.
 
+The transaction-routing suite adds five focused tests for Leader changes during prepare:
+
+```console
+$ python3 test_txn_routing.py
+Ran 5 tests
+OK
+```
+
+Prepare follows `not_leader` hints or tries other known nodes when the cached Leader is unreachable, always with the same `txn_id`. Lock conflicts stop routing retries, and commit/abort target the node that actually handled prepare.
+
 ---
 
 ## Architecture / 架构
@@ -103,6 +113,7 @@ It verifies that an isolated old Leader rejects a read without quorum and conver
 - Auto redirect — non-leader automatically forwards writes/reads to shard leader / 非 Leader 自动转发请求到分片 Leader
 - Quorum-validated Leader reads reject isolated old Leaders; not yet a complete ReadIndex implementation / Leader 本地读前确认多数派，隔离旧 Leader 会拒绝读取；尚非完整 ReadIndex
 - Multi-key transactions via 2PC (v5) — atomically write across shards / 跨分片原子事务（v5）
+- Transaction prepare follows Leader changes and records the actual participant for commit/abort / prepare 阶段跟随 Leader 变化，commit/abort 发往实际 participant
 - Batch writes (v5) — concurrent requests merged into one Raft round / 批量写入，并发请求合并（v5）
 - List type — `lpush` / `lrange` for storing message history (v1/v2) / 列表类型，用于存储聊天历史（v1/v2）
 - Split-brain demo — simulate network partition with `isolate`/`heal` (v1) / 脑裂演示（v1）
@@ -160,6 +171,7 @@ sleep 5
 # 运行自动化测试 / Run automated tests
 python3 test_raft_sharded.py
 python3 test_read_quorum.py
+python3 test_txn_routing.py
 ```
 
 ### Cloud (AWS) / 云端运行
@@ -217,7 +229,9 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `client.py` | 交互式命令行客户端，手动操作 v1 KV store（get / set / lpush / lrange 等） |
 | `test_raft_sharded.py` | v5 的全自动测试套件（56 个 runtime checks，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、Leader-routed reads、批量写入 |
 | `test_read_quorum.py` | 3 个 read-quorum logic tests + 1 个 live failure-injection regression；验证隔离旧 Leader 拒绝 stale read |
+| `test_txn_routing.py` | 5 个 focused tests；覆盖 Leader hint、不可达 fallback、锁冲突、相同 txn_id 与实际 phase-2 participant |
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only read 与 quorum-validated Leader read 的区别、故障场景和 ReadIndex 边界 |
+| `docs/LESSON_02_TXN_LEADER_CHANGES.md` | prepare 可安全 discovery 的边界，以及 phase-2 仍需 durable recovery 的原因 |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
 | `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
@@ -234,7 +248,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | GET | `/health` | per-shard Raft state (role, term, leader, log_length...) / 各分片 Raft 状态 |
 | POST | `/set` | write a key-value pair (batched, Raft-replicated) / 写入（批量合并，Raft 复制） |
 | POST | `/delete` | delete a key (Raft-replicated) / 删除 key（Raft 复制） |
-| POST | `/txn` | multi-key atomic transaction — 2PC coordinator / 多 key 原子事务（协调者） |
+| POST | `/txn` | 2PC coordinator with prepare-time participant Leader discovery / prepare 阶段可发现新 Leader 的 2PC 协调者 |
 | POST | `/txn_prepare` | lock keys and stage intent — shard leader internal / 锁定 key，暂存意图（内部） |
 | POST | `/txn_commit` | commit transaction via Raft — shard leader internal / 通过 Raft 提交事务（内部） |
 | POST | `/txn_abort` | abort transaction, release locks — internal / 中止事务，释放锁（内部） |
@@ -484,6 +498,8 @@ Atomically write multiple keys across different shards — all succeed or all fa
 
 - Keys are locked per-shard; conflicting transactions return `{"status": "locked"}` / key 按分片加锁，冲突事务返回 locked
 - Lock timeout: 10s; background `txn_cleanup_loop()` auto-releases stale locks / 10秒超时，后台线程自动释放死锁
+- Prepare retries stale/unreachable Leader routes with the same `txn_id`; deterministic failures such as `locked` are not retried / prepare 使用相同 txn_id 跟随 Leader 变化；locked 等确定性失败不会被误当作路由失败
+- Phase 2 targets the participant that actually handled prepare, not the stale cached Leader / commit/abort 发往实际完成 prepare 的 participant
 
 **Verification / 验证：**
 ```bash
@@ -667,5 +683,6 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 - **Modulo sharding, not consistent hashing** — keys are placed by `MD5(key) % NUM_SHARDS`, and `NUM_SHARDS` is derived from the node count. Changing the cluster size therefore remaps nearly every key, so this design does *not* have the minimal-remapping property of consistent hashing (no hash ring, no virtual nodes) / 分片用 `MD5(key) % NUM_SHARDS`，而 `NUM_SHARDS` 由节点数决定。改变集群规模会导致几乎所有 key 重新映射，因此不具备一致性哈希的最小重映射特性（没有哈希环，也没有虚拟节点）
 - **Read barrier is not full ReadIndex** — it rejects an isolated old Leader, but complete linearizability still depends on the remaining Raft election, log, commit/apply, and durability invariants / read quorum 阻止隔离旧 Leader 读旧值，但完整线性一致性仍依赖尚未完成的 Raft invariants
 - **2PC coordinator crash** — if the coordinator crashes between Prepare and Commit, affected shards stay locked until the 10s timeout expires / 协调者在 Prepare 和 Commit 之间崩溃，分片 key 会锁住直到 10s 超时
+- **2PC phase-2 recovery is not durable** — routing commit/abort to the in-memory prepare participant does not recover a decision after a participant or coordinator crash / phase 2 会发往内存中的实际 participant，但 participant 或 coordinator 崩溃后的 decision 尚不可恢复
 - **txn_commit not batched** — transaction commits still use one Raft round per key; only regular `/set` and `/delete` benefit from batching / 事务提交每个 key 独立走一次 Raft round，未合并批处理
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口

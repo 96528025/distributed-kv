@@ -92,6 +92,45 @@ def send_get_rpc(port, path, timeout=0.5):
 def majority():
     return len(ALL_PORTS) // 2 + 1
 
+def send_txn_prepare_with_discovery(txn_id, shard_id, ops, initial_leader):
+    """Locate the current shard Leader and send phase-1 prepare.
+
+    A stale Leader hint or an unreachable cached Leader may be retried on other known
+    nodes because phase 1 has not made a global commit decision. Every attempt uses the
+    same txn_id. Deterministic participant results such as ``ready`` and ``locked`` are
+    returned immediately instead of being mistaken for routing failures.
+
+    Returns ``(result, participant_port)``. This only hardens phase-1 routing; prepared
+    intents and the coordinator decision are still not durable or failure-safe.
+    """
+    candidates = []
+    if initial_leader is not None:
+        candidates.append(initial_leader)
+    candidates.extend(port for port in ALL_PORTS if port != initial_leader)
+    attempted = set()
+
+    while candidates:
+        port = candidates.pop(0)
+        if port in attempted:
+            continue
+        attempted.add(port)
+
+        result = send_rpc(port, "/txn_prepare", {
+            "txn_id": txn_id,
+            "shard_id": shard_id,
+            "ops": ops,
+        })
+        if result is None:
+            continue
+        if result.get("status") == "not_leader":
+            hinted_leader = result.get("leader")
+            if hinted_leader in ALL_PORTS and hinted_leader not in attempted:
+                candidates.insert(0, hinted_leader)
+            continue
+        return result, port
+
+    return {"status": "unreachable"}, initial_leader
+
 def apply_entry(entry):
     """将一条日志条目应用到 store（调用前必须持有 store_lock）"""
     if entry.get("op") == "delete":
@@ -961,17 +1000,17 @@ class Handler(BaseHTTPRequestHandler):
             shard_leaders[sid] = leader
 
         # ── Phase 1: Prepare ──────────────────────────────
-        prepare_results = {}
-        prep_lock       = threading.Lock()
+        prepare_results      = {}
+        prepared_participants = {}
+        prep_lock            = threading.Lock()
 
         def do_prepare(sid, leader, ops_list):
-            result = send_rpc(leader, "/txn_prepare", {
-                "txn_id":   txn_id,
-                "shard_id": sid,
-                "ops":      ops_list,
-            })
+            result, participant = send_txn_prepare_with_discovery(
+                txn_id, sid, ops_list, leader
+            )
             with prep_lock:
-                prepare_results[sid] = result or {"status": "unreachable"}
+                prepare_results[sid] = result
+                prepared_participants[sid] = participant
 
         prep_threads = [
             threading.Thread(
@@ -984,7 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
         for t in prep_threads:
             t.start()
         for t in prep_threads:
-            t.join(timeout=1.0)
+            # Each discovery attempt is bounded by send_rpc's timeout. Waiting for all
+            # results avoids starting phase 2 against stale cached addresses.
+            t.join()
 
         all_ready = all(
             prepare_results.get(sid, {}).get("status") == "ready"
@@ -998,7 +1039,11 @@ class Handler(BaseHTTPRequestHandler):
             send_rpc(leader, action, {"txn_id": txn_id, "shard_id": sid}, timeout=2.0)
 
         action_threads = [
-            threading.Thread(target=do_action, args=(shard_leaders[sid], sid), daemon=True)
+            threading.Thread(
+                target=do_action,
+                args=(prepared_participants.get(sid, shard_leaders[sid]), sid),
+                daemon=True,
+            )
             for sid in shard_ops
         ]
         for t in action_threads:
@@ -1027,7 +1072,10 @@ class Handler(BaseHTTPRequestHandler):
 
         with shard.lock:
             if shard.role != LEADER:
-                self._respond(200, {"status": "not_leader"})
+                self._respond(200, {
+                    "status": "not_leader",
+                    "leader": shard.leader_id,
+                })
                 return
 
             # 检查 key 是否已被其他事务锁定
