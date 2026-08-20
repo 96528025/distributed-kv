@@ -146,6 +146,13 @@ class ReadQuorumRegressionTest(unittest.TestCase):
             pattern = os.path.join(BASE, f"snapshot_{port}_shard*.json")
             for snapshot_file in glob.glob(pattern):
                 os.remove(snapshot_file)
+            # Raft hard state must go too, or currentTerm carries over into the
+            # next run: the nodes restart on these same ports and resume at the
+            # term they left off at instead of 0. The suite still passes that
+            # way, but it stops being hermetic -- terms climb run over run.
+            for hard_state in glob.glob(
+                    os.path.join(BASE, f"raft_hardstate_{port}.json*")):
+                os.remove(hard_state)
 
     def _pause(self, port):
         os.kill(self.processes[port].pid, signal.SIGSTOP)
