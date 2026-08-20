@@ -4,6 +4,10 @@ snapshot_*.json
 wal_*.log
 checkpoint_*.json
 checkpoint_*.json.tmp
+
+# Raft election hard state (currentTerm / votedFor)
+raft_hardstate_*.json
+raft_hardstate_*.json.tmp
 __pycache__/
 *.pyc
 venv/

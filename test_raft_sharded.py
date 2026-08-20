@@ -120,10 +120,10 @@ def stop_all():
     time.sleep(1)
 
 def clean_files():
-    for f in glob.glob(os.path.join(BASE, "snapshot_*.json")):
-        os.remove(f)
-    for f in glob.glob(os.path.join(BASE, "data_raft_sharded_*.json")):
-        os.remove(f)
+    for pattern in ("snapshot_*.json", "data_raft_sharded_*.json",
+                    "raft_hardstate_*.json", "raft_hardstate_*.json.tmp"):
+        for f in glob.glob(os.path.join(BASE, pattern)):
+            os.remove(f)
 
 
 def _final_cleanup():
