@@ -34,8 +34,14 @@ jobs:
       - name: Run full integration suite (56 checks)
         run: python3 test_raft_sharded.py
 
+      # Safety regression suite. Each check maps to a named invariant in
+      # docs/RAFT_CORRECTNESS.md. Deterministic: one real node with its election
+      # timeout pinned, driven by hand-built RPCs.
+      - name: Run Raft correctness suite (24 checks)
+        run: python3 test_raft_correctness.py
+
       - name: Clean up stray node processes and test artifacts
         if: always()
         run: |
           pkill -f node_raft_sharded.py || true
-          rm -f data_raft_sharded_*.json snapshot_*.json
+          rm -f data_raft_sharded_*.json snapshot_*.json raft_hardstate_*.json*

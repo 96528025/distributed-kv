@@ -304,6 +304,8 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `benchmark_storage.py` | JSON 全量重写与 WAL append 的存储层 microbenchmark；结果见 `benchmarks/storage_benchmark.md` |
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only read 与 quorum-validated Leader read 的区别、故障场景和 ReadIndex 边界 |
 | `docs/LESSON_02_TXN_LEADER_CHANGES.md` | prepare 可安全 discovery 的边界，以及 phase-2 仍需 durable recovery 的原因 |
+| `docs/RAFT_CORRECTNESS.md` | 五条 Raft 安全属性逐条对照代码；已修（C1/C2）与已知未修（C4/C5）的状态表 |
+| `INTERVIEW.md` | WAL + checkpoint 的白板讲解稿：崩溃点逐个证明、Raft log 与 storage WAL 的分工、跨平台基准数字 |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
 | `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
