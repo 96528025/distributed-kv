@@ -29,6 +29,7 @@ import time
 import random
 import os
 
+import metrics as metrics_mod
 import storage as storage_mod
 
 # ── 启动参数 ──────────────────────────────────────────────
@@ -94,6 +95,86 @@ SNAPSHOT_THRESHOLD = 20   # log 超过 20 条就触发快照（小值方便演�
 BATCH_MAX_SIZE     = 20   # 每批最多合并 20 条写请求
 BATCH_TIMEOUT      = 0.005  # 最长等待 5ms 积攒批次
 READ_QUORUM_TIMEOUT = 0.5   # Leader 读前确认多数派的最长等待时间
+
+
+# ── 可观测性（进程内、低基数 Prometheus metrics）───────────
+metrics_registry = metrics_mod.Registry()
+
+HTTP_REQUESTS = metrics_registry.counter(
+    "distributed_kv_http_requests_total",
+    "HTTP responses produced by this node.",
+    ("method", "route", "status"),
+)
+HTTP_REQUEST_DURATION = metrics_registry.histogram(
+    "distributed_kv_http_request_duration_seconds",
+    "End-to-end HTTP handler duration in seconds.",
+    (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+    ("method", "route"),
+)
+RAFT_ELECTIONS = metrics_registry.counter(
+    "distributed_kv_raft_elections_total",
+    "Election attempts started by this node.",
+    ("shard",),
+)
+RAFT_LEADER_TRANSITIONS = metrics_registry.counter(
+    "distributed_kv_raft_leader_transitions_total",
+    "Times this node became Leader.",
+    ("shard",),
+)
+READ_QUORUM_CHECKS = metrics_registry.counter(
+    "distributed_kv_read_quorum_checks_total",
+    "Leader read-barrier checks grouped by result.",
+    ("shard", "outcome"),
+)
+REPLICATION_ROUND_DURATION = metrics_registry.histogram(
+    "distributed_kv_raft_replication_round_duration_seconds",
+    "Time spent waiting for a replication majority.",
+    (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0),
+    ("shard", "outcome"),
+)
+SNAPSHOT_OPERATIONS = metrics_registry.counter(
+    "distributed_kv_snapshot_operations_total",
+    "Successful local snapshot creates and follower installs.",
+    ("shard", "operation"),
+)
+TRANSACTION_RESULTS = metrics_registry.counter(
+    "distributed_kv_transaction_coordinator_results_total",
+    "Client-visible transaction coordinator results; reported_ok is not proof of atomic commit.",
+    ("outcome",),
+)
+
+NODE_INFO = metrics_registry.gauge(
+    "distributed_kv_node_info",
+    "Static process identity and configured storage backend.",
+    ("port", "backend"),
+)
+RAFT_TERM = metrics_registry.gauge(
+    "distributed_kv_raft_term",
+    "Current in-memory term by shard.",
+    ("shard",),
+)
+RAFT_COMMIT_INDEX = metrics_registry.gauge(
+    "distributed_kv_raft_commit_index",
+    "Current in-memory commit index by shard.",
+    ("shard",),
+)
+RAFT_LOG_ENTRIES = metrics_registry.gauge(
+    "distributed_kv_raft_log_entries",
+    "Number of entries in the current in-memory log window.",
+    ("shard",),
+)
+RAFT_ROLE = metrics_registry.gauge(
+    "distributed_kv_raft_role",
+    "One-hot current role by shard.",
+    ("shard", "role"),
+)
+PENDING_TRANSACTIONS = metrics_registry.gauge(
+    "distributed_kv_pending_transactions",
+    "Prepared in-memory transactions by shard.",
+    ("shard",),
+)
+
+NODE_INFO.set(1, port=MY_PORT, backend=BACKEND)
 
 
 # ── 全局 KV 状态机（所有分片共用）────────────────────────
@@ -219,6 +300,36 @@ class ShardRaft:
 shards = [ShardRaft(i) for i in range(NUM_SHARDS)]
 
 
+def refresh_state_metrics():
+    """Refresh scrape-time gauges without holding Raft and metric locks together."""
+    snapshots = []
+    for shard in shards:
+        with shard.lock:
+            snapshots.append({
+                "shard": shard.shard_id,
+                "term": shard.term,
+                "commit_index": shard.commit_index,
+                "log_entries": len(shard.log),
+                "role": shard.role,
+                "pending_transactions": len(shard.pending_txns),
+            })
+
+    for state in snapshots:
+        shard_label = state["shard"]
+        RAFT_TERM.set(state["term"], shard=shard_label)
+        RAFT_COMMIT_INDEX.set(state["commit_index"], shard=shard_label)
+        RAFT_LOG_ENTRIES.set(state["log_entries"], shard=shard_label)
+        PENDING_TRANSACTIONS.set(
+            state["pending_transactions"], shard=shard_label
+        )
+        for role in (FOLLOWER, CANDIDATE, LEADER):
+            RAFT_ROLE.set(
+                1 if state["role"] == role else 0,
+                shard=shard_label,
+                role=role,
+            )
+
+
 # ── 状态机持久化 ───────────────────────────────────────────
 # 只有已 committed 且正在 apply 的操作可以进入该路径。调用方必须持有
 # store_lock 且不能持有 shard.lock；锁序固定为 store_lock → storage engine lock。
@@ -312,6 +423,7 @@ def maybe_snapshot(shard):
         shard.log            = shard.log[cut:]
         shard.log_offset     = ci + 1
 
+    SNAPSHOT_OPERATIONS.inc(shard=shard.shard_id, operation="create")
     print(f"  📸 分片{shard.shard_id} 快照已保存"
           f"（snapshot_index={ci}，日志剩余 {len(shard.log)} 条）")
 
@@ -379,6 +491,7 @@ def batch_loop(shard):
         print(f"\n📦 [分片{sid} 批量] 合并 {len(batch)} 条写入为一次 Raft round")
 
         # 并发复制给所有 Follower
+        replication_started = time.monotonic()
         acks      = [MY_PORT]
         ack_lock  = threading.Lock()
         ack_event = threading.Event()
@@ -417,6 +530,11 @@ def batch_loop(shard):
         ack_event.wait(timeout=1.0)
 
         if len(acks) >= majority():
+            REPLICATION_ROUND_DURATION.observe(
+                time.monotonic() - replication_started,
+                shard=sid,
+                outcome="success",
+            )
             with shard.lock:
                 shard.commit_index = last_abs
             with store_lock:
@@ -438,6 +556,11 @@ def batch_loop(shard):
                 item["result"][0] = (True, None)
                 item["event"].set()
         else:
+            REPLICATION_ROUND_DURATION.observe(
+                time.monotonic() - replication_started,
+                shard=sid,
+                outcome="quorum_unavailable",
+            )
             err = f"majority not reached ({len(acks)}/{majority()})"
             for item in batch:
                 item["result"][0] = (False, err)
@@ -457,6 +580,7 @@ def start_election(shard):
         last_log_term  = shard.log[-1]["term"] if shard.log else shard.snapshot_term
         sid            = shard.shard_id
 
+    RAFT_ELECTIONS.inc(shard=sid)
     print(f"\n🗳️  [分片{sid} Term {term}] 节点 {MY_PORT} 发起选举")
 
     for port in PEER_PORTS:
@@ -496,6 +620,7 @@ def _become_leader_locked(shard):
     """在持有 shard.lock 时调用，升为 Leader 并立刻发心跳"""
     shard.role      = LEADER
     shard.leader_id = MY_PORT
+    RAFT_LEADER_TRANSITIONS.inc(shard=shard.shard_id)
     print(f"\n👑 [分片{shard.shard_id} Term {shard.term}] 节点 {MY_PORT} 当选 Leader！")
     threading.Thread(target=send_heartbeats, args=(shard,), daemon=True).start()
 
@@ -554,6 +679,7 @@ def confirm_read_quorum(shard, timeout=READ_QUORUM_TIMEOUT):
     """
     with shard.lock:
         if shard.role != LEADER:
+            READ_QUORUM_CHECKS.inc(shard=shard.shard_id, outcome="not_leader")
             return False
         term      = shard.term
         ci        = shard.commit_index
@@ -563,6 +689,7 @@ def confirm_read_quorum(shard, timeout=READ_QUORUM_TIMEOUT):
         sid       = shard.shard_id
 
     if majority() == 1:
+        READ_QUORUM_CHECKS.inc(shard=sid, outcome="success")
         return True
 
     responses = []
@@ -610,13 +737,19 @@ def confirm_read_quorum(shard, timeout=READ_QUORUM_TIMEOUT):
             shard.voted_for = None
             shard.leader_id = None
         if shard.role != LEADER or shard.term != term:
+            outcome = "higher_term" if higher_term > term else "leadership_changed"
+            READ_QUORUM_CHECKS.inc(shard=sid, outcome=outcome)
             return False
 
     acknowledgements = 1 + sum(
         1 for result in peer_responses
         if result and result.get("success") and result.get("term") == term
     )
-    return acknowledgements >= majority()
+    if acknowledgements >= majority():
+        READ_QUORUM_CHECKS.inc(shard=sid, outcome="success")
+        return True
+    READ_QUORUM_CHECKS.inc(shard=sid, outcome="unavailable")
+    return False
 
 
 def election_timer():
@@ -636,9 +769,33 @@ def election_timer():
 
 
 # ── HTTP 处理 ───────────────────────────────────────────────
+METRIC_ROUTES = frozenset({
+    "/get",
+    "/all",
+    "/health",
+    "/metrics",
+    "/set",
+    "/delete",
+    "/vote",
+    "/append_entries",
+    "/install_snapshot",
+    "/txn",
+    "/txn_prepare",
+    "/txn_commit",
+    "/txn_abort",
+})
+
+
+def metric_route(path):
+    """Return a bounded route label; never expose keys or arbitrary paths."""
+    route = path.split("?", 1)[0]
+    return route if route in METRIC_ROUTES else "unknown"
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+        self._begin_request()
         if self.path.startswith("/get"):
             key   = self.path.split("=")[-1]
             sid   = get_shard(key)
@@ -703,10 +860,14 @@ class Handler(BaseHTTPRequestHandler):
                     }
             self._respond(200, {"node": MY_PORT, "shards": shard_info})
 
+        elif self.path == "/metrics":
+            self._respond_metrics()
+
         else:
             self._respond(404, {"error": "unknown endpoint"})
 
     def do_POST(self):
+        self._begin_request()
         length = int(self.headers.get("Content-Length", 0))
         body   = json.loads(self.rfile.read(length))
 
@@ -745,6 +906,7 @@ class Handler(BaseHTTPRequestHandler):
         label = f"{key} = {value}" if op == "set" else f"DELETE {key}"
         print(f"\n📝 [分片{sid} Leader] 写入日志[{log_index}]: {label}")
 
+        replication_started = time.monotonic()
         acks      = [MY_PORT]
         ack_lock  = threading.Lock()
         ack_event = threading.Event()
@@ -783,6 +945,11 @@ class Handler(BaseHTTPRequestHandler):
         ack_event.wait(timeout=1.0)
 
         if len(acks) >= majority():
+            REPLICATION_ROUND_DURATION.observe(
+                time.monotonic() - replication_started,
+                shard=sid,
+                outcome="success",
+            )
             with shard.lock:
                 shard.commit_index = log_index
             with store_lock:
@@ -800,6 +967,11 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
             return True, None
         else:
+            REPLICATION_ROUND_DURATION.observe(
+                time.monotonic() - replication_started,
+                shard=sid,
+                outcome="quorum_unavailable",
+            )
             return False, f"failed to reach majority ({len(acks)}/{majority()})"
 
     def _handle_set(self, body):
@@ -1012,6 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
                         "log_offset":     snap["log_offset"],
                         "store":          snap["store"],
                     }, f)
+                SNAPSHOT_OPERATIONS.inc(shard=sid, operation="install")
                 print(f"  📥 分片{sid} 从 Leader {snap_leader} 安装快照"
                       f"（snapshot_index={snap['snapshot_index']}）")
         elif to_apply:
@@ -1063,6 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
         """协调者：执行两阶段提交"""
         ops = body.get("ops", [])
         if not ops:
+            TRANSACTION_RESULTS.inc(outcome="invalid")
             self._respond(400, {"error": "ops is empty"})
             return
 
@@ -1080,6 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
             with shards[sid].lock:
                 leader = shards[sid].leader_id
             if leader is None:
+                TRANSACTION_RESULTS.inc(outcome="unavailable")
                 self._respond(503, {"error": f"no leader for shard {sid}", "txn_id": txn_id})
                 return
             shard_leaders[sid] = leader
@@ -1137,8 +1312,13 @@ class Handler(BaseHTTPRequestHandler):
             t.join(timeout=3.0)
 
         if all_ready:
+            # The existing coordinator does not validate every phase-2 result.  Keep
+            # the metric honest: this is the response reported to the client, not a
+            # claim that all participants durably committed.
+            TRANSACTION_RESULTS.inc(outcome="reported_ok")
             self._respond(200, {"status": "ok", "txn_id": txn_id})
         else:
+            TRANSACTION_RESULTS.inc(outcome="aborted")
             failed = [sid for sid in shard_ops
                       if prepare_results.get(sid, {}).get("status") != "ready"]
             self._respond(200, {
@@ -1226,9 +1406,44 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, {"status": "ok"})
 
     def _respond(self, code, data):
+        self._record_request(code)
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _begin_request(self):
+        self._metrics_started = time.monotonic()
+        self._metrics_route = metric_route(self.path)
+        self._metrics_recorded = False
+
+    def _record_request(self, code):
+        if getattr(self, "_metrics_recorded", False):
+            return
+        self._metrics_recorded = True
+        method = self.command
+        route = getattr(self, "_metrics_route", metric_route(self.path))
+        started = getattr(self, "_metrics_started", time.monotonic())
+        HTTP_REQUESTS.inc(method=method, route=route, status=code)
+        HTTP_REQUEST_DURATION.observe(
+            max(0.0, time.monotonic() - started),
+            method=method,
+            route=route,
+        )
+
+    def _respond_metrics(self):
+        # Count the scrape before rendering so the first scrape proves that generic
+        # request instrumentation is connected to the endpoint.
+        self._record_request(200)
+        refresh_state_metrics()
+        body = metrics_registry.render().encode("utf-8")
+        self.send_response(200)
+        self.send_header(
+            "Content-type", "text/plain; version=0.0.4; charset=utf-8"
+        )
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 

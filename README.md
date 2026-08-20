@@ -60,6 +60,32 @@ Prepare follows `not_leader` hints or tries other known nodes when the cached Le
 
 ---
 
+## Observability: Metrics Phase A + B / 可观测性指标
+
+Each v5 node exposes dependency-free Prometheus text metrics on `GET /metrics`.
+Phase A provides the thread-safe counter/gauge/histogram primitives, bounded HTTP route
+labels, request totals/latency, the scrape endpoint, and endpoint tests. Phase B connects
+the distributed-system paths: election attempts, Leader transitions, read-quorum results,
+replication-round latency/outcomes, snapshot create/install operations, transaction
+coordinator responses, and scrape-time Raft state gauges.
+
+每个 v5 节点通过 `GET /metrics` 导出不依赖第三方库的 Prometheus 文本指标。Phase A
+提供线程安全的指标基础、低基数 HTTP route label、请求数/延迟、端点和测试；Phase B
+把选举、Leader 切换、读 quorum、复制 round、快照、事务结果与 Raft 当前状态接入指标。
+
+```bash
+curl http://localhost:5001/metrics
+python3 test_metrics.py  # 9 checks, including a real HTTP endpoint
+```
+
+Metric labels intentionally exclude keys, values, request IDs, and transaction IDs. The
+transaction outcome `reported_ok` describes the existing client-visible response; it does
+not overstate the current coordinator as failure-safe atomic 2PC. Counters are process-local
+and reset on restart. Metric definitions and suggested first alerts are documented in
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
+
+---
+
 ## Persistence: WAL + Checkpoint / 持久化：WAL + Checkpoint
 
 The legacy JSON full-store rewrite remains the default for backward compatibility. The
@@ -238,6 +264,7 @@ python3 test_raft_sharded.py
 python3 test_read_quorum.py
 python3 test_txn_routing.py
 python3 test_wal.py
+python3 test_metrics.py
 
 # Storage benchmark smoke test / 存储基准冒烟
 python3 benchmark_storage.py --quick --no-save
@@ -299,11 +326,14 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | `test_raft_sharded.py` | v5 的全自动测试套件（56 个 runtime checks，约 30s）。覆盖：读写、Leader 转发、快照压缩、节点重启恢复、2PC 事务、锁冲突、锁超时、/delete、Leader-routed reads、批量写入 |
 | `test_read_quorum.py` | 3 个 read-quorum logic tests + 1 个 live failure-injection regression；验证隔离旧 Leader 拒绝 stale read |
 | `test_txn_routing.py` | 5 个 focused tests；覆盖 Leader hint、不可达 fallback、锁冲突、相同 txn_id 与实际 phase-2 participant |
+| `metrics.py` | 标准库实现的线程安全 Counter、Gauge、Histogram 与 Prometheus 文本导出；固定 label schema |
+| `test_metrics.py` | 8 个 metrics/接线路径单元测试 + 1 个真实 `/metrics` HTTP endpoint test |
 | `storage.py` | `StorageEngine` abstraction、legacy JSON backend、append-only WAL、checksum replay 与 atomic checkpoint |
 | `test_wal.py` | 17 项 WAL/checkpoint 检查，含真实三节点两次 SIGKILL 恢复与 post-restart index continuity |
 | `benchmark_storage.py` | JSON 全量重写与 WAL append 的存储层 microbenchmark；结果见 `benchmarks/storage_benchmark.md` |
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only read 与 quorum-validated Leader read 的区别、故障场景和 ReadIndex 边界 |
 | `docs/LESSON_02_TXN_LEADER_CHANGES.md` | prepare 可安全 discovery 的边界，以及 phase-2 仍需 durable recovery 的原因 |
+| `docs/OBSERVABILITY.md` | Phase A/B 边界、完整 metric contract、cardinality 与告警建议 |
 | `start.sh` | 一键启动 3 个 v1 KV 节点（端口 5001/5002/5003） |
 | `start_chat.sh` | 一键启动 3 个 Chat Server（端口 9001/9002/9003），需先运行 `start.sh` |
 
@@ -318,6 +348,7 @@ python3 chat_server.py 9003 <virginia-ip>:5001 <oregon-ip>:5002 <ireland-ip>:500
 | GET | `/get?key=<k>` | route to shard Leader and confirm quorum before local read; not yet full ReadIndex / 路由到 Leader 并在本地读前确认多数派，尚非完整 ReadIndex |
 | GET | `/all` | dump all data / 查看所有数据 |
 | GET | `/health` | per-shard Raft state (role, term, leader, log_length...) / 各分片 Raft 状态 |
+| GET | `/metrics` | Prometheus text metrics for HTTP and distributed-system paths / HTTP 与分布式系统路径指标 |
 | POST | `/set` | write a key-value pair (batched, Raft-replicated) / 写入（批量合并，Raft 复制） |
 | POST | `/delete` | delete a key (Raft-replicated) / 删除 key（Raft 复制） |
 | POST | `/txn` | 2PC coordinator with prepare-time participant Leader discovery / prepare 阶段可发现新 Leader 的 2PC 协调者 |
@@ -760,4 +791,5 @@ These apply to the latest version (`node_raft_sharded.py`). Earlier versions (`n
 - **WAL is opt-in and fsync-per-commit is off by default** — default JSON behavior is preserved; WAL `flush()` covers tested process crashes, while power-loss durability requires `--fsync` / WAL 需显式开启，默认每次 commit 不 fsync；进程强杀已验证，掉电级持久需 `--fsync`
 - **Checkpoint pauses local writes briefly** — rotation writes one O(N) full-state checkpoint while holding `store_lock`; the threshold trades write amplification against replay length / checkpoint 轮换会短暂阻塞本节点写入，阈值用于权衡写放大与恢复 replay 长度
 - **Storage durability does not complete Raft durability** — term, vote, and full Raft log recovery remain separate unfinished work / storage WAL 不等于完整 Raft 持久化，term、vote 与完整 Raft log 恢复仍是独立未完成项
+- **Metrics are process-local** — counters reset on node restart; no Prometheus server, long-term retention, dashboard, alert manager, tracing, or authentication is bundled / 指标随节点重启清零；项目尚未内置 Prometheus 持久存储、dashboard、告警、tracing 或认证
 - **No /keys endpoint** — no way to list all existing keys / 没有列出所有 key 的接口

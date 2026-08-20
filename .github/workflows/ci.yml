@@ -29,6 +29,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # No pip install: the KV store and its test suite use only the standard library.
+      - name: Run metrics and observability tests (9 checks)
+        run: python3 -m unittest -v test_metrics.py
+
       # This step spins up a real 3-node cluster on localhost:5001-5003 and runs all
       # 56 integration checks. It is intentionally NOT a lint or syntax check.
       - name: Run full integration suite (56 checks)
