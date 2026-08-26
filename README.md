@@ -222,7 +222,7 @@ tails, rotation, JSON compatibility, and a real three-node cluster surviving two
 - Raft consensus leader election (v5) / simple min-port election (v1) / Raft 共识选主（v5）/最小端口当 Leader（v1）
 - Auto redirect — non-leader automatically forwards writes/reads to shard leader / 非 Leader 自动转发请求到分片 Leader
 - Quorum-validated Leader reads reject isolated old Leaders; not yet a complete ReadIndex implementation / Leader 本地读前确认多数派，隔离旧 Leader 会拒绝读取；尚非完整 ReadIndex
-- Multi-key transactions via 2PC (v5) — atomically write across shards / 跨分片原子事务（v5）
+- Multi-key transactions via 2PC (v5) - coordinates prepare/commit across shards in the failure-free path; crash recovery is incomplete / 跨分片 2PC 在无故障路径中协调 prepare/commit；崩溃恢复尚未完成
 - Transaction prepare follows Leader changes and records the actual participant for commit/abort / prepare 阶段跟随 Leader 变化，commit/abort 发往实际 participant
 - Optional append-only WAL + atomic checkpoint backend; legacy JSON remains default / 可选 WAL + 原子 checkpoint，默认仍为兼容 JSON backend
 - Batch writes (v5) — concurrent requests merged into one Raft round / 批量写入，并发请求合并（v5）
@@ -611,9 +611,13 @@ With snapshots, the log is truncated after each commit batch; a restarting node 
 
 **Feature 2: Multi-key Transactions (2PC) / 多 key 事务（两阶段提交）**
 
-Atomically write multiple keys across different shards — all succeed or all fail.
+Coordinates multi-key writes across shards with prepare/commit. In failure-free runs,
+all prepared shards commit or the coordinator aborts. Coordinator and participant crash
+recovery is not durable yet, so this is not a production-grade atomic transaction protocol.
 
-原子地跨多个分片写入多个 key——要么全成功，要么全失败。
+通过 prepare/commit 协调跨分片多 key 写入。在无故障运行中，所有已 prepare 的分片会一起
+commit，或由协调者 abort。协调者和 participant 崩溃后的决策恢复尚未持久化，因此当前实现
+不是生产级、故障安全的原子事务协议。
 
 ```
 客户端 → POST /txn → 协调者节点
