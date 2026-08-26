@@ -40,8 +40,26 @@ jobs:
       - name: Run Raft correctness suite (24 checks)
         run: python3 test_raft_correctness.py
 
+      # Pure routing logic, no cluster: Leader hint, unreachable fallback, lock
+      # conflict, repeated txn_id, phase-2 participant selection.
+      - name: Run transaction routing suite (5 tests)
+        run: python3 test_txn_routing.py
+
+      # Real 3-node cluster on 5101-5103, including a live failure-injection
+      # regression that SIGSTOPs the leader and asserts the isolated old leader
+      # refuses the stale read.
+      - name: Run read-quorum suite (4 tests)
+        run: python3 test_read_quorum.py
+
+      # Storage layer: WAL framing and checksum replay, atomic checkpoint
+      # publication, and a real 3-node cluster on 6301-6303 taken down twice
+      # with SIGKILL. Runs entirely inside its own temp dirs.
+      - name: Run WAL and checkpoint suite (17 checks)
+        run: python3 test_wal.py
+
       - name: Clean up stray node processes and test artifacts
         if: always()
         run: |
           pkill -f node_raft_sharded.py || true
-          rm -f data_raft_sharded_*.json snapshot_*.json raft_hardstate_*.json*
+          rm -f data_raft_sharded_*.json snapshot_*.json raft_hardstate_*.json* \
+                wal_*.log checkpoint_*.json*
