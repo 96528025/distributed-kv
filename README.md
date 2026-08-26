@@ -14,9 +14,27 @@ Demonstrates core distributed systems concepts: Raft consensus, leader election,
 
 ---
 
-## Verified: 56/56 automated integration checks passing / 自动化集成检查全部通过
+## Verified: 106 automated checks across 5 suites, all run in CI / 自动化检查全部通过
 
-The full Raft + sharding + transaction suite is reproducible in one command — no external dependencies, it spins up a real 3-node cluster on `localhost:5001-5003`:
+Every suite below runs on each push and pull request, on Python 3.12 and 3.14 —
+the badge above is green only when all 106 pass. No external dependencies; the
+suites spin up real 3-node clusters and kill them with `SIGKILL` and `SIGSTOP`.
+
+下列每个套件都会在每次 push 和 PR 时运行（Python 3.12 / 3.14 双版本），106 项全过徽章才是绿的。
+无外部依赖，会真实拉起三节点集群，并用 `SIGKILL` / `SIGSTOP` 制造故障。
+
+| Suite | Checks | What it covers |
+|---|---|---|
+| `test_raft_sharded.py` | 56 | Election, replication, snapshot compaction & recovery, `install_snapshot`, 2PC, Leader-routed reads, batch writes |
+| `test_raft_correctness.py` | 24 | Raft safety invariants, each mapped to a named case in `docs/RAFT_CORRECTNESS.md` |
+| `test_wal.py` | 17 | WAL framing & checksum replay, atomic checkpoint, two `SIGKILL` rounds on a live cluster |
+| `test_txn_routing.py` | 5 | Leader hint, unreachable fallback, lock conflict, repeated `txn_id`, phase-2 participants |
+| `test_read_quorum.py` | 4 | Quorum-validated Leader read; an isolated old Leader must refuse the stale read |
+
+The largest suite is reproducible in one command — it spins up a real 3-node
+cluster on `localhost:5001-5003`:
+
+最大的那个套件一条命令即可复现，会真实拉起 `localhost:5001-5003` 三节点集群：
 
 一条命令即可复现完整的 Raft + 分片 + 事务测试，无需外部依赖，会真实拉起 `localhost:5001-5003` 三节点集群：
 
@@ -233,11 +251,12 @@ python3 node_raft_sharded.py 5002 5001 5003 &
 python3 node_raft_sharded.py 5003 5001 5002 &
 sleep 5
 
-# 运行自动化测试 / Run automated tests
-python3 test_raft_sharded.py
-python3 test_read_quorum.py
-python3 test_txn_routing.py
-python3 test_wal.py
+# 运行自动化测试 / Run automated tests（与 CI 完全一致，共 106 项）
+python3 test_raft_sharded.py       # 56
+python3 test_raft_correctness.py   # 24
+python3 test_txn_routing.py        #  5
+python3 test_read_quorum.py        #  4
+python3 test_wal.py                # 17
 
 # Storage benchmark smoke test / 存储基准冒烟
 python3 benchmark_storage.py --quick --no-save
