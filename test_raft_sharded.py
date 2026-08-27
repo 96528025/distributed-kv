@@ -149,6 +149,26 @@ def get_shard_leader(key):
     return None, None
 
 
+def health(port=None, attempts=6, delay=0.5):
+    """Fetch /health, retrying briefly before giving up.
+
+    http_get returns None on any error, including a timeout while the machine is
+    loaded. Indexing ["shards"] straight off that None turns a transient blip into
+    a TypeError that aborts the whole run with a stack trace, instead of a failure
+    the summary can report.
+    """
+    target = PORTS[0] if port is None else port
+    for _ in range(attempts):
+        h = http_get(target, "/health")
+        if h and h.get("shards"):
+            return h
+        time.sleep(delay)
+    check("/health reachable", False,
+          f"node {target} did not answer /health after {attempts} attempts")
+    stop_all()
+    sys.exit(1)
+
+
 # ══════════════════════════════════════════════════════════
 #  tests begin
 # ══════════════════════════════════════════════════════════
@@ -194,7 +214,7 @@ section("2. Leader forwarding (write to a non-leader)")
 # find a node that is not the leader for key "forward_test"
 import hashlib
 sid_ft = int(hashlib.md5("forward_test".encode()).hexdigest(), 16) % len(PORTS)
-h = http_get(PORTS[0], "/health")
+h = health()
 leader_ft = h["shards"][str(sid_ft)]["leader"]
 non_leader = next((p for p in PORTS if p != leader_ft), None)
 
@@ -231,7 +251,7 @@ if snap_files:
           f"snapshot_index={snap.get('snapshot_index')}, log_offset={snap.get('log_offset')}")
 
 # verify the leader's log was truncated (log_length < 60)
-h = http_get(PORTS[0], "/health")
+h = health()
 max_log = max(info["log_length"] for info in h["shards"].values())
 check(f"log truncated (max log_length={max_log} < 60)", max_log < 60,
       "snapshot compaction took effect and old entries were removed")
@@ -425,7 +445,7 @@ check("the rewritten value is readable", r and r.get("value") == "reborn")
 # send delete to a non-leader to verify forwarding
 import hashlib
 sid_del = int(hashlib.md5("to_delete".encode()).hexdigest(), 16) % len(PORTS)
-h = http_get(PORTS[0], "/health")
+h = health()
 leader_del = h["shards"][str(sid_del)]["leader"]
 non_leader_del = next((p for p in PORTS if p != leader_del), None)
 if non_leader_del:
@@ -452,7 +472,7 @@ for port in PORTS:
 # a non-leader read response must carry forwarded_by
 import hashlib
 sid_lk = int(hashlib.md5("linear_key".encode()).hexdigest(), 16) % len(PORTS)
-h = http_get(PORTS[0], "/health")
+h = health()
 leader_lk = h["shards"][str(sid_lk)]["leader"]
 non_leaders = [p for p in PORTS if p != leader_lk]
 if non_leaders:
