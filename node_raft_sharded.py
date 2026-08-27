@@ -454,7 +454,7 @@ def load_hard_state():
         shards[sid].term      = s.get("term", 0)
         shards[sid].voted_for = s.get("voted_for")
         restored[sid]         = s.get("term", 0)
-    print(f"  🗳️  恢复 Raft hard state（各分片 currentTerm={restored}）")
+    print(f"  🗳️  restored Raft hard state (currentTerm per shard = {restored})")
 
 
 def _last_log_locked(shard):
@@ -473,7 +473,7 @@ def load_from_disk():
     recovered = storage.load()
     if recovered:
         store.update(recovered)
-        print(f"  💾 [{BACKEND}] 从存储引擎恢复了 {len(store)} 条数据")
+        print(f"  💾 [{BACKEND}] recovered {len(store)} entries from the storage engine")
 
     # Raft snapshot 恢复日志压缩元数据。legacy JSON backend 保留原有的 snapshot
     # store merge 行为；WAL backend 的状态机数据只由 storage checkpoint + WAL 恢复，
@@ -491,7 +491,7 @@ def load_from_disk():
                 shard.snapshot_term  = snap["snapshot_term"]
                 shard.log_offset     = snap["log_offset"]
                 shard.commit_index   = snap["snapshot_index"]
-            print(f"  📸 分片{shard.shard_id} 从快照恢复（snapshot_index={snap['snapshot_index']}）")
+            print(f"  📸 shard {shard.shard_id} recovered from snapshot (snapshot_index={snap['snapshot_index']})")
 
     # Storage applied indexes are state-machine recovery metadata, not Raft snapshots.
     # They prevent WAL record index reuse after restart without pretending to recover
@@ -553,7 +553,7 @@ def maybe_snapshot(shard):
         shard.log_offset     = ci + 1
 
     SNAPSHOT_OPERATIONS.inc(shard=shard.shard_id, operation="create")
-    print(f"  📸 分片{shard.shard_id} 快照已保存"
+    print(f"  📸 shard {shard.shard_id} snapshot saved"
           f"（snapshot_index={ci}，日志剩余 {len(shard.log)} 条）")
 
 
@@ -574,7 +574,7 @@ def txn_cleanup_loop():
                     for op in ops:
                         shard.key_locks.pop(op["key"], None)
                     shard.lock_expiry.pop(txn_id, None)
-                    print(f"  ⏱️  分片{shard.shard_id}: 事务 {txn_id} 超时，自动释放锁")
+                    print(f"  ⏱️  shard {shard.shard_id}: transaction {txn_id} timed out; lock released")
 
 
 # ── 批量写入循环 ────────────────────────────────────────────
@@ -617,7 +617,7 @@ def batch_loop(shard):
 
             last_abs = shard.log_offset + len(shard.log) - 1   # 最后一条的绝对 index
 
-        print(f"\n📦 [分片{sid} 批量] 合并 {len(batch)} 条写入为一次 Raft round")
+        print(f"\n📦 [shard {sid} batch] merged {len(batch)} writes into one Raft round")
 
         # 并发复制给所有 Follower
         replication_started = time.monotonic()
@@ -680,7 +680,7 @@ def batch_loop(shard):
                     ))
                 persist_committed(records)
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
-            print(f"  🎉 分片{sid} 批量提交成功（{len(batch)} 条）")
+            print(f"  🎉 shard {sid} batch committed ({len(batch)} writes)")
             for item in batch:
                 item["result"][0] = (True, None)
                 item["event"].set()
@@ -713,7 +713,7 @@ def start_election(shard):
     persist_hard_state()
 
     RAFT_ELECTIONS.inc(shard=sid)
-    print(f"\n🗳️  [分片{sid} Term {term}] 节点 {MY_PORT} 发起选举")
+    print(f"\n🗳️  [shard {sid} term {term}] node {MY_PORT} started an election")
 
     for port in PEER_PORTS:
         def request_vote(p, t, lli, llt):
@@ -744,7 +744,7 @@ def start_election(shard):
                         result.get("term") == shard.term):
                     shard.votes_received.add(p)
                     cnt = len(shard.votes_received)
-                    print(f"   ✅ 分片{sid}: 收到节点 {p} 的投票（{cnt}/{majority()} 票）")
+                    print(f"   ✅ shard {sid}: vote received from node {p} ({cnt}/{majority()})")
                     if cnt >= majority():
                         _become_leader_locked(shard)
 
@@ -760,7 +760,7 @@ def _become_leader_locked(shard):
     shard.role      = LEADER
     shard.leader_id = MY_PORT
     RAFT_LEADER_TRANSITIONS.inc(shard=shard.shard_id)
-    print(f"\n👑 [分片{shard.shard_id} Term {shard.term}] 节点 {MY_PORT} 当选 Leader！")
+    print(f"\n👑 [shard {shard.shard_id} term {shard.term}] node {MY_PORT} elected leader")
     threading.Thread(target=send_heartbeats, args=(shard,), daemon=True).start()
 
 
@@ -1099,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
             log_index = len(shard.log) - 1 + shard.log_offset   # 绝对 index
 
         label = f"{key} = {value}" if op == "set" else f"DELETE {key}"
-        print(f"\n📝 [分片{sid} Leader] 写入日志[{log_index}]: {label}")
+        print(f"\n📝 [shard {sid} leader] appended log[{log_index}]: {label}")
 
         replication_started = time.monotonic()
         acks      = [MY_PORT]
@@ -1126,7 +1126,7 @@ class Handler(BaseHTTPRequestHandler):
             if result and result.get("success"):
                 with ack_lock:
                     acks.append(port)
-                    print(f"  ✅ 分片{sid}: 节点 {port} 确认（{len(acks)}/{majority()} 节点）")
+                    print(f"  ✅ shard {sid}: node {port} acknowledged ({len(acks)}/{majority()} nodes)")
                     if len(acks) >= majority():
                         ack_event.set()
 
@@ -1157,7 +1157,7 @@ class Handler(BaseHTTPRequestHandler):
                     key=key,
                     value=value if op == "set" else None,
                 )])
-            print(f"  🎉 分片{sid} 已提交：{label}")
+            print(f"  🎉 shard {sid} committed: {label}")
             # 异步触发快照（不阻塞当前请求）
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
             return True, None
@@ -1181,7 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if r != LEADER:
             if l is not None:
-                print(f"\n↪️  分片{sid} 的 Leader 是 {l}，转发...")
+                print(f"\n↪️  leader for shard {sid} is {l}; forwarding...")
                 result = send_rpc(l, "/set", {"key": key, "value": value})
                 if result:
                     result["forwarded_by"] = MY_PORT
@@ -1227,7 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if r != LEADER:
             if l is not None:
-                print(f"\n↪️  分片{sid} 的 Leader 是 {l}，转发删除...")
+                print(f"\n↪️  leader for shard {sid} is {l}; forwarding the delete...")
                 result = send_rpc(l, "/delete", {"key": key})
                 if result:
                     result["forwarded_by"] = MY_PORT
@@ -1309,10 +1309,10 @@ class Handler(BaseHTTPRequestHandler):
             persist_hard_state()
 
         if vote_granted:
-            print(f"  🗳️  分片{sid}: 投票给节点 {candidate_id}（Term {candidate_term}）")
+            print(f"  🗳️  shard {sid}: voted for node {candidate_id} (term {candidate_term})")
         elif not up_to_date:
-            print(f"  🚫 分片{sid}: 拒绝 {candidate_id} —— 日志落后"
-                  f"（候选人 last log ({cand_last_term}, {cand_last_index})"
+            print(f"  🚫 shard {sid}: refused {candidate_id} -- stale log"
+                  f" (candidate last log ({cand_last_term}, {cand_last_index})"
                   f" < 本节点 ({my_last_term}, {my_last_index})）")
 
         self._respond(200, {"term": resp_term, "vote_granted": vote_granted})
@@ -1361,7 +1361,7 @@ class Handler(BaseHTTPRequestHandler):
                         if shard.log[rel_i]["term"] != prev_log_term:
                             # 冲突：该位置 term 不一致，截断到冲突点并拒绝
                             shard.log = shard.log[:rel_i]
-                            print(f"  ⚠️  分片{sid}: prevLog 冲突（index={prev_log_index}），"
+                            print(f"  ⚠️  shard {sid}: prevLog conflict (index={prev_log_index}), "
                                   f"截断至 rel_i={rel_i}")
                             conflict_resp = {"term": shard.term, "success": False,
                                              "conflict_index": prev_log_index}
@@ -1426,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
                         "store":          snap["store"],
                     }, f)
                 SNAPSHOT_OPERATIONS.inc(shard=sid, operation="install")
-                print(f"  📥 分片{sid} 从 Leader {snap_leader} 安装快照"
+                print(f"  📥 shard {sid} installing a snapshot from leader {snap_leader}"
                       f"（snapshot_index={snap['snapshot_index']}）")
         elif to_apply:
             with store_lock:
@@ -1601,7 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
             shard.pending_txns[txn_id] = ops
             shard.lock_expiry[txn_id]  = time.time() + 10
 
-        print(f"  🔒 分片{sid}: 事务 {txn_id} PREPARE"
+        print(f"  🔒 shard {sid}: transaction {txn_id} PREPARE"
               f"（keys={[op['key'] for op in ops]}）")
         self._respond(200, {"status": "ready"})
 
@@ -1622,7 +1622,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, {"status": "not_leader"})
             return
 
-        print(f"  ✅ 分片{sid}: 事务 {txn_id} COMMIT（{len(ops)} 条写入）")
+        print(f"  ✅ shard {sid}: transaction {txn_id} COMMIT ({len(ops)} writes)")
         for op in ops:
             success, err = self._do_raft_op(shard, op["key"], op.get("value"), op.get("op", "set"))
             if not success:
@@ -1643,7 +1643,7 @@ class Handler(BaseHTTPRequestHandler):
                 shard.key_locks.pop(op["key"], None)
             shard.lock_expiry.pop(txn_id, None)
 
-        print(f"  ❌ 分片{sid}: 事务 {txn_id} ABORT")
+        print(f"  ❌ shard {sid}: transaction {txn_id} ABORT")
         self._respond(200, {"status": "ok"})
 
     def _respond(self, code, data):
@@ -1694,16 +1694,16 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── 启动 ────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"🚀 分片 Raft 节点启动：port {MY_PORT}")
-    print(f"   集群：{ALL_PORTS}，分片数：{NUM_SHARDS}")
+    print(f"🚀 sharded Raft node starting on port {MY_PORT}")
+    print(f"   cluster: {ALL_PORTS}   shards: {NUM_SHARDS}")
     load_hard_state()   # 必须在任何选举计时器启动之前恢复 currentTerm/votedFor
     load_from_disk()
 
-    print(f"\n📊 分片规划（每个分片独立选 Leader）：")
+    print(f"\n📊 shard plan (each shard elects its own leader):")
     for s in range(NUM_SHARDS):
-        print(f"   分片 {s}: Raft Group = {ALL_PORTS}（待选举）")
+        print(f"   shard {s}: Raft group = {ALL_PORTS} (election pending)")
 
-    print(f"\n✅ 节点 {MY_PORT} 就绪\n")
+    print(f"\n✅ node {MY_PORT} ready\n")
 
     threading.Thread(target=election_timer,   daemon=True).start()
     threading.Thread(target=heartbeat_loop,   daemon=True).start()
