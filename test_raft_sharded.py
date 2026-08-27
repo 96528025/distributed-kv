@@ -1,24 +1,24 @@
 """
-自动化测试：node_raft_sharded.py（快照压缩 + 多 key 事务）
+Automated tests for node_raft_sharded.py (snapshot compaction + multi-key transactions)
 
-运行方式：
+Usage:
   python3 test_raft_sharded.py
 
-测试覆盖（section 编号与运行输出一致）：
-  0. 准备环境：清理旧文件 + 启动三节点集群 + 等待各分片选出 Leader
-  1. 基础读写
-  2. Leader 转发（向非 Leader 节点写入）
-  3. 日志快照压缩（写够 60 条触发快照，验证文件生成 + log 截断）
-  4. 快照恢复 / Follower 落后追赶（重启节点，走 install_snapshot，验证数据不丢）
-  5. 多 key 事务（2PC 正常提交）
-  6. 事务锁冲突（prepare 冲突 → abort）
-  7. 事务锁超时自动释放（等待 cleanup_loop）
-  8. /delete 端点（含转发、幂等、删后重写）
-  9. 线性化读（/get 路由到 Leader）
- 10. 批量写入（10 并发 set + 5 并发 delete 合并为一次 Raft round）
+Coverage (section numbers match the run output):
+  0. Environment setup: clear old files, start the 3-node cluster, wait for a leader per shard
+  1. Basic read/write
+  2. Leader forwarding (writing to a non-leader node)
+  3. Log snapshot compaction (60 writes trigger a snapshot; verify the file and log truncation)
+  4. Snapshot recovery / follower catch-up (restart a node through install_snapshot, no data lost)
+  5. Multi-key transactions (2PC, normal commit)
+  6. Transaction lock conflict (prepare conflict -> abort)
+  7. Transaction lock timeout release (waits for cleanup_loop)
+  8. /delete endpoint (forwarding, idempotency, rewrite after delete)
+  9. Linearizable reads (/get routed to the leader)
+ 10. Batch writes (10 concurrent sets + 5 concurrent deletes merged into one Raft round)
 
-这是一个集成测试脚本，不是 unittest/pytest 套件：
-上述 11 个 section 在运行时共产生 56 个断言（check），全部通过时输出 56/56。
+This is an integration script rather than a unittest/pytest suite: the 11 sections above produce
+56 assertions (checks) at run time, and a full pass prints 56/56.
 """
 
 import json
@@ -32,7 +32,7 @@ import glob
 import threading
 import atexit
 
-# ── 配置 ──────────────────────────────────────────────────
+# ── configuration ─────────────────────────────────────────
 PORTS   = [5001, 5002, 5003]
 BASE    = os.path.dirname(os.path.abspath(__file__))
 SCRIPT  = os.path.join(BASE, "node_raft_sharded.py")
@@ -44,7 +44,7 @@ INFO = "\033[94mℹ️ \033[0m"
 results = []   # [(name, ok, detail)]
 
 
-# ── 工具函数 ────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────
 def http_get(port, path, timeout=3):
     try:
         with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as r:
@@ -78,7 +78,7 @@ def section(title):
     print(f"{'─'*55}")
 
 def wait_for_cluster(timeout=12):
-    """等待三个节点全部就绪且所有分片都选出 Leader"""
+    """Wait until all three nodes are up and every shard has elected a leader."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -127,20 +127,20 @@ def clean_files():
 
 
 def _final_cleanup():
-    """无论正常结束、测试失败还是中途抛异常/Ctrl-C，都保证节点进程被杀掉、
-    生成的 data/snapshot 文件被清理。没有这个钩子时，异常路径会留下三个
-    node_raft_sharded.py 进程占着 5001-5003 端口。"""
+    """Kill the node processes and clean up generated data/snapshot files on every exit path:
+    normal completion, test failure, an exception, or Ctrl-C. Without this hook the error paths
+    leave three node_raft_sharded.py processes holding ports 5001-5003."""
     stop_all()
     clean_files()
 
 atexit.register(_final_cleanup)
 
 def get_shard_leader(key):
-    """通过任意节点找到 key 所在分片的 Leader"""
+    """Find the leader of the shard owning a key, asking any node."""
     r = http_get(PORTS[0], f"/get?key={key}")
     if r and "shard_leader" in r:
         return r["shard"], r["shard_leader"]
-    # key 不存在时，从 health 里查
+    # if the key does not exist, look it up via /health
     import hashlib
     sid = int(hashlib.md5(key.encode()).hexdigest(), 16) % len(PORTS)
     h = http_get(PORTS[0], "/health")
@@ -150,48 +150,48 @@ def get_shard_leader(key):
 
 
 # ══════════════════════════════════════════════════════════
-#  测试开始
+#  tests begin
 # ══════════════════════════════════════════════════════════
-print("\n🚀 开始自动化测试：node_raft_sharded.py")
-print(f"   脚本路径：{SCRIPT}")
+print("\n🚀 Automated tests: node_raft_sharded.py")
+print(f"   script: {SCRIPT}")
 
-# ── 0. 环境准备 ─────────────────────────────────────────
-section("0. 准备环境（清理旧文件 + 启动集群）")
+# ── 0. environment setup ────────────────────────────────
+section("0. Environment setup (clear old files, start the cluster)")
 stop_all()
 clean_files()
-print(f"  {INFO} 旧文件已清理")
+print(f"  {INFO} old files cleared")
 
 procs = []
 for port in PORTS:
     peers = [p for p in PORTS if p != port]
     procs.append(start_node(port, peers))
-print(f"  {INFO} 三个节点已启动，等待选举...")
+print(f"  {INFO} three nodes started, waiting for elections...")
 
 ok = wait_for_cluster(timeout=15)
-check("集群启动并完成选举", ok)
+check("cluster started and elected leaders", ok)
 if not ok:
-    print("\n⛔ 集群无法启动，终止测试")
+    print("\n⛔ cluster failed to start; aborting")
     stop_all()
     sys.exit(1)
 
 
-# ── 1. 基础读写 ─────────────────────────────────────────
-section("1. 基础读写")
+# ── 1. basic read/write ─────────────────────────────────
+section("1. Basic read/write")
 
 r = http_post(PORTS[0], "/set", {"key": "hello", "value": "world"})
-check("写入 hello=world", r and r.get("status") == "ok", str(r))
+check("write hello=world", r and r.get("status") == "ok", str(r))
 
 time.sleep(0.3)
 for port in PORTS:
     r = http_get(port, "/get?key=hello")
-    check(f"节点 {port} 读取 hello", r and r.get("value") == "world",
+    check(f"node {port} reads hello", r and r.get("value") == "world",
           f"value={r.get('value') if r else 'None'}")
 
 
-# ── 2. Leader 转发 ─────────────────────────────────────
-section("2. Leader 转发（向非 Leader 写入）")
+# ── 2. leader forwarding ────────────────────────────────
+section("2. Leader forwarding (write to a non-leader)")
 
-# 找一个对 key "forward_test" 来说不是 Leader 的节点
+# find a node that is not the leader for key "forward_test"
 import hashlib
 sid_ft = int(hashlib.md5("forward_test".encode()).hexdigest(), 16) % len(PORTS)
 h = http_get(PORTS[0], "/health")
@@ -200,83 +200,83 @@ non_leader = next((p for p in PORTS if p != leader_ft), None)
 
 if non_leader:
     r = http_post(non_leader, "/set", {"key": "forward_test", "value": "forwarded"})
-    check(f"向非 Leader {non_leader} 写入（转发到 {leader_ft}）",
+    check(f"write to non-leader {non_leader} (forwarded to {leader_ft})",
           r and r.get("status") == "ok" and "forwarded_by" in r,
           str(r))
     time.sleep(0.3)
     r2 = http_get(PORTS[0], "/get?key=forward_test")
-    check("转发后可读到数据", r2 and r2.get("value") == "forwarded")
+    check("data readable after forwarding", r2 and r2.get("value") == "forwarded")
 else:
-    check("Leader 转发", False, "找不到非 Leader 节点")
+    check("leader forwarding", False, "no non-leader node found")
 
 
-# ── 3. 日志快照压缩 ─────────────────────────────────────
-section("3. 日志快照压缩（写 60 条触发快照）")
+# ── 3. log snapshot compaction ──────────────────────────
+section("3. Log snapshot compaction (60 writes trigger a snapshot)")
 
-print(f"  {INFO} 写入 60 条 key（k1~k60）...")
+print(f"  {INFO} writing 60 keys (k1..k60)...")
 for i in range(1, 61):
     http_post(PORTS[0], "/set", {"key": f"k{i}", "value": f"v{i}"})
-time.sleep(1)  # 等快照异步完成
+time.sleep(1)  # wait for the async snapshot to finish
 
 snap_files = glob.glob(os.path.join(BASE, "snapshot_*.json"))
-check("快照文件已生成", len(snap_files) > 0,
-      f"找到 {len(snap_files)} 个快照文件：{[os.path.basename(f) for f in snap_files]}")
+check("snapshot file created", len(snap_files) > 0,
+      f"found {len(snap_files)} snapshot file(s): {[os.path.basename(f) for f in snap_files]}")
 
-# 验证快照内容格式
+# verify the snapshot format
 if snap_files:
     with open(snap_files[0]) as f:
         snap = json.load(f)
     required_keys = {"snapshot_index", "snapshot_term", "log_offset", "store"}
-    check("快照文件格式正确", required_keys.issubset(snap.keys()),
+    check("snapshot file format is correct", required_keys.issubset(snap.keys()),
           f"snapshot_index={snap.get('snapshot_index')}, log_offset={snap.get('log_offset')}")
 
-# 验证 Leader 的日志已截断（log_length < 60）
+# verify the leader's log was truncated (log_length < 60)
 h = http_get(PORTS[0], "/health")
 max_log = max(info["log_length"] for info in h["shards"].values())
-check(f"日志已截断（最大 log_length={max_log} < 60）", max_log < 60,
-      "快照压缩生效，旧日志已删除")
+check(f"log truncated (max log_length={max_log} < 60)", max_log < 60,
+      "snapshot compaction took effect and old entries were removed")
 
-# 验证快照后数据仍可读
+# data must remain readable after the snapshot
 r = http_get(PORTS[0], "/get?key=k1")
-check("快照后 k1 仍可读", r and r.get("value") == "v1")
+check("k1 still readable after the snapshot", r and r.get("value") == "v1")
 r = http_get(PORTS[0], "/get?key=k60")
-check("快照后 k60 仍可读", r and r.get("value") == "v60")
+check("k60 still readable after the snapshot", r and r.get("value") == "v60")
 
 
-# ── 4. 快照恢复（重启节点）───────────────────────────────
-section("4. 快照恢复（重启一个节点）")
+# ── 4. snapshot recovery (restart a node) ───────────────
+section("4. Snapshot recovery (restart one node)")
 
-target = PORTS[1]  # 重启 5002
-print(f"  {INFO} 关闭节点 {target}...")
+target = PORTS[1]  # restart 5002
+print(f"  {INFO} stopping node {target}...")
 stop_node(target)
 time.sleep(2)
 
-print(f"  {INFO} 重启节点 {target}...")
+print(f"  {INFO} restarting node {target}...")
 peers = [p for p in PORTS if p != target]
 new_proc = start_node(target, peers)
 procs.append(new_proc)
 
-print(f"  {INFO} 等待节点重新加入集群...")
+print(f"  {INFO} waiting for the node to rejoin the cluster...")
 time.sleep(6)
 
-# 验证重启后数据仍可读
+# data must remain readable after the restart
 r = http_get(target, "/get?key=k1")
-check(f"节点 {target} 重启后读 k1", r and r.get("value") == "v1",
+check(f"node {target} reads k1 after restart", r and r.get("value") == "v1",
       f"value={r.get('value') if r else 'None'}")
 r = http_get(target, "/get?key=k30")
-check(f"节点 {target} 重启后读 k30", r and r.get("value") == "v30",
+check(f"node {target} reads k30 after restart", r and r.get("value") == "v30",
       f"value={r.get('value') if r else 'None'}")
 r = http_get(target, "/get?key=k60")
-check(f"节点 {target} 重启后读 k60", r and r.get("value") == "v60",
+check(f"node {target} reads k60 after restart", r and r.get("value") == "v60",
       f"value={r.get('value') if r else 'None'}")
 
-# 重启后集群仍可写
+# the cluster must still accept writes after the restart
 r = http_post(PORTS[0], "/set", {"key": "after_restart", "value": "yes"})
-check("重启后集群仍可写入", r and r.get("status") == "ok")
+check("cluster still writable after restart", r and r.get("status") == "ok")
 
 
-# ── 5. 多 key 事务（正常提交）─────────────────────────────
-section("5. 多 key 事务（正常提交）")
+# ── 5. multi-key transaction (normal commit) ────────────
+section("5. Multi-key transaction (normal commit)")
 
 r = http_post(PORTS[0], "/txn", {
     "ops": [
@@ -284,145 +284,145 @@ r = http_post(PORTS[0], "/txn", {
         {"key": "bob",   "value": "200"},
     ]
 }, timeout=10)
-check("事务提交成功", r and r.get("status") == "ok", f"txn_id={r.get('txn_id') if r else None}")
+check("transaction committed", r and r.get("status") == "ok", f"txn_id={r.get('txn_id') if r else None}")
 
 time.sleep(0.5)
 ra = http_get(PORTS[0], "/get?key=alice")
 rb = http_get(PORTS[0], "/get?key=bob")
-check("alice=100 写入正确", ra and ra.get("value") == "100",
+check("alice=100 written correctly", ra and ra.get("value") == "100",
       f"value={ra.get('value') if ra else 'None'}")
-check("bob=200 写入正确",   rb and rb.get("value") == "200",
+check("bob=200 written correctly",   rb and rb.get("value") == "200",
       f"value={rb.get('value') if rb else 'None'}")
 
-# 两个 key 从不同节点都能读到
+# both keys must be readable from different nodes
 ra2 = http_get(PORTS[1], "/get?key=alice")
 rb2 = http_get(PORTS[2], "/get?key=bob")
-check("alice 在节点 5002 可读", ra2 and ra2.get("value") == "100")
-check("bob 在节点 5003 可读",   rb2 and rb2.get("value") == "200")
+check("alice readable on node 5002", ra2 and ra2.get("value") == "100")
+check("bob readable on node 5003",   rb2 and rb2.get("value") == "200")
 
 
-# ── 6. 事务锁冲突（prepare 冲突 → abort）─────────────────
-section("6. 事务锁冲突（并发事务 → 其中一个 abort）")
+# ── 6. transaction lock conflict (prepare -> abort) ─────
+section("6. Transaction lock conflict (concurrent txns -> one aborts)")
 
-# 找 alice 所在分片的 Leader，手动 prepare 锁住它
+# find the leader of alice's shard and lock it with a manual prepare
 sid_alice, leader_alice = get_shard_leader("alice")
-print(f"  {INFO} alice 在分片 {sid_alice}，Leader={leader_alice}")
+print(f"  {INFO} alice is on shard {sid_alice}, leader={leader_alice}")
 
-# Phase 1: 手动 prepare 锁住 alice
+# Phase 1: manual prepare locks alice
 r_prep = http_post(leader_alice, "/txn_prepare", {
     "txn_id":   "test-conflict-001",
     "shard_id": sid_alice,
     "ops":      [{"key": "alice", "value": "locked"}],
 })
-check("手动 prepare 成功锁住 alice", r_prep and r_prep.get("status") == "ready",
+check("manual prepare locked alice", r_prep and r_prep.get("status") == "ready",
       str(r_prep))
 
-# 此时发起另一个事务修改 alice → 应该 abort
+# a second transaction touching alice must now abort
 r_txn = http_post(PORTS[0], "/txn", {
     "ops": [{"key": "alice", "value": "conflict"}]
 }, timeout=5)
-check("冲突事务被 abort",
+check("the conflicting transaction aborted",
       r_txn and r_txn.get("status") == "aborted",
       f"reason={r_txn.get('reason') if r_txn else None}")
 
 locked_detail = (r_txn or {}).get("details", {})
-check("abort 原因包含 locked 信息",
+check("the abort reason mentions the lock",
       any(v.get("status") == "locked" for v in locked_detail.values()),
       str(locked_detail))
 
-# alice 的值未被修改
+# alice's value must be unchanged
 time.sleep(0.3)
 r = http_get(PORTS[0], "/get?key=alice")
-check("alice 值未被冲突事务修改", r and r.get("value") == "100",
+check("alice unchanged by the conflicting transaction", r and r.get("value") == "100",
       f"value={r.get('value') if r else 'None'}")
 
-# 手动 abort 释放锁
+# manual abort releases the lock
 r_abort = http_post(leader_alice, "/txn_abort", {
     "txn_id":   "test-conflict-001",
     "shard_id": sid_alice,
 })
-check("手动 abort 释放锁", r_abort and r_abort.get("status") == "ok")
+check("manual abort released the lock", r_abort and r_abort.get("status") == "ok")
 
-# 释放后新事务可以成功
+# a new transaction can succeed once the lock is released
 r_after = http_post(PORTS[0], "/txn", {
     "ops": [{"key": "alice", "value": "after_unlock"}]
 }, timeout=10)
-check("释放锁后新事务成功", r_after and r_after.get("status") == "ok")
+check("new transaction succeeds after the lock is released", r_after and r_after.get("status") == "ok")
 
 
-# ── 7. 事务锁超时自动释放 ──────────────────────────────
-section("7. 事务锁超时自动释放（等待 cleanup_loop）")
+# ── 7. transaction lock timeout release ─────────────────
+section("7. Transaction lock timeout release (waits for cleanup_loop)")
 
-print(f"  {INFO} 注意：锁超时设为 10s，此测试需要等待约 12s...")
+print(f"  {INFO} note: the lock timeout is 10s, so this test waits about 12s...")
 
-# 找 bob 的分片 Leader
+# find the leader of bob's shard
 sid_bob, leader_bob = get_shard_leader("bob")
-print(f"  {INFO} bob 在分片 {sid_bob}，Leader={leader_bob}")
+print(f"  {INFO} bob is on shard {sid_bob}, leader={leader_bob}")
 
-# prepare 锁住 bob，但不 commit 也不 abort（模拟崩溃的协调者）
+# prepare locks bob but never commits or aborts, simulating a crashed coordinator
 r_prep2 = http_post(leader_bob, "/txn_prepare", {
     "txn_id":   "test-timeout-002",
     "shard_id": sid_bob,
     "ops":      [{"key": "bob", "value": "will_timeout"}],
 })
-check("prepare 成功（锁住 bob）", r_prep2 and r_prep2.get("status") == "ready")
+check("prepare succeeded (bob locked)", r_prep2 and r_prep2.get("status") == "ready")
 
-# 立刻尝试修改 bob → 应该被锁
+# an immediate attempt to modify bob must be blocked
 r_blocked = http_post(PORTS[0], "/txn",
                       {"ops": [{"key": "bob", "value": "blocked"}]}, timeout=5)
-check("bob 被锁时事务 abort",
+check("transaction aborts while bob is locked",
       r_blocked and r_blocked.get("status") == "aborted")
 
-# 等待超时自动释放（10s + buffer）
-print(f"  {INFO} 等待锁超时（12s）...")
+# wait for the automatic timeout release (10s plus buffer)
+print(f"  {INFO} waiting for the lock to time out (12s)...")
 time.sleep(12)
 
-# 超时后应能成功写入
+# the write must succeed once the lock has timed out
 r_after2 = http_post(PORTS[0], "/txn", {
     "ops": [{"key": "bob", "value": "after_timeout"}]
 }, timeout=10)
-check("锁超时后新事务成功", r_after2 and r_after2.get("status") == "ok",
+check("new transaction succeeds after the lock times out", r_after2 and r_after2.get("status") == "ok",
       str(r_after2))
 
 time.sleep(0.5)
 r_bob = http_get(PORTS[0], "/get?key=bob")
-check("bob 值已更新为 after_timeout",
+check("bob updated to after_timeout",
       r_bob and r_bob.get("value") == "after_timeout",
       f"value={r_bob.get('value') if r_bob else 'None'}")
 
 
-# ── 8. /delete 端点 ────────────────────────────────────────
-section("8. /delete 端点")
+# ── 8. /delete endpoint ─────────────────────────────────
+section("8. /delete endpoint")
 
-# 先写一个 key，再删除
+# write a key, then delete it
 r = http_post(PORTS[0], "/set", {"key": "to_delete", "value": "bye"})
-check("delete 前先写入 to_delete", r and r.get("status") == "ok")
+check("write to_delete before deleting", r and r.get("status") == "ok")
 time.sleep(0.3)
 
 r = http_post(PORTS[0], "/delete", {"key": "to_delete"})
-check("DELETE to_delete 返回 ok",
+check("DELETE to_delete returns ok",
       r and r.get("status") == "ok" and r.get("deleted") is True, str(r))
 time.sleep(0.5)
 
-# 删除后三个节点都读不到
+# after deletion the key must be gone on all three nodes
 for port in PORTS:
     r = http_get(port, "/get?key=to_delete")
-    check(f"节点 {port} 读不到已删除的 key",
+    check(f"node {port} no longer returns the deleted key",
           r is None or r.get("error") is not None or "value" not in r,
           str(r))
 
-# 删除不存在的 key 也应该正常返回 ok（幂等）
+# deleting a missing key must still return ok (idempotent)
 r = http_post(PORTS[0], "/delete", {"key": "nonexistent_xyz"})
-check("删除不存在的 key 幂等返回 ok", r and r.get("status") == "ok")
+check("deleting a missing key returns ok (idempotent)", r and r.get("status") == "ok")
 
-# 删除后重新写入同一个 key
+# the same key can be written again after deletion
 r = http_post(PORTS[0], "/set", {"key": "to_delete", "value": "reborn"})
-check("删除后可以重新写入同一个 key", r and r.get("status") == "ok")
+check("the same key can be rewritten after deletion", r and r.get("status") == "ok")
 time.sleep(0.3)
 r = http_get(PORTS[0], "/get?key=to_delete")
-check("重新写入后可以读到新值", r and r.get("value") == "reborn")
+check("the rewritten value is readable", r and r.get("value") == "reborn")
 
-# 向非 Leader 发 delete，验证转发
+# send delete to a non-leader to verify forwarding
 import hashlib
 sid_del = int(hashlib.md5("to_delete".encode()).hexdigest(), 16) % len(PORTS)
 h = http_get(PORTS[0], "/health")
@@ -430,26 +430,26 @@ leader_del = h["shards"][str(sid_del)]["leader"]
 non_leader_del = next((p for p in PORTS if p != leader_del), None)
 if non_leader_del:
     r = http_post(non_leader_del, "/delete", {"key": "to_delete"})
-    check(f"向非 Leader {non_leader_del} 发 delete 自动转发",
+    check(f"delete sent to non-leader {non_leader_del} is forwarded",
           r and r.get("status") == "ok" and "forwarded_by" in r, str(r))
 
 
-# ── 9. 线性化读（读路由到 Leader）─────────────────────────
-section("9. 线性化读（/get 路由到 Leader）")
+# ── 9. linearizable reads (routed to the leader) ────────
+section("9. Linearizable reads (/get routed to the leader)")
 
-# 写入一个 key
+# write a key
 r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v1"})
-check("写入 linear_key=v1", r and r.get("status") == "ok")
+check("write linear_key=v1", r and r.get("status") == "ok")
 time.sleep(0.3)
 
-# 从三个节点读，结果都是 v1（非 Leader 会被转发到 Leader）
+# all three nodes must return v1; non-leaders forward to the leader
 for port in PORTS:
     r = http_get(port, "/get?key=linear_key")
-    check(f"节点 {port} 读 linear_key = v1（线性化）",
+    check(f"node {port} reads linear_key = v1 (linearizable)",
           r and r.get("value") == "v1",
           f"value={r.get('value') if r else 'None'}, forwarded_by={r.get('forwarded_by') if r else '-'}")
 
-# 验证非 Leader 节点的读响应包含 forwarded_by
+# a non-leader read response must carry forwarded_by
 import hashlib
 sid_lk = int(hashlib.md5("linear_key".encode()).hexdigest(), 16) % len(PORTS)
 h = http_get(PORTS[0], "/health")
@@ -457,28 +457,28 @@ leader_lk = h["shards"][str(sid_lk)]["leader"]
 non_leaders = [p for p in PORTS if p != leader_lk]
 if non_leaders:
     r = http_get(non_leaders[0], "/get?key=linear_key")
-    check(f"非 Leader {non_leaders[0]} 读取包含 forwarded_by 字段",
+    check(f"non-leader {non_leaders[0]} read includes forwarded_by",
           r and "forwarded_by" in r,
           str(r))
 
-# Leader 直接读，不含 forwarded_by
+# a direct leader read must not carry forwarded_by
 r = http_get(leader_lk, "/get?key=linear_key")
-check(f"Leader {leader_lk} 直接读，不含 forwarded_by",
+check(f"leader {leader_lk} reads directly, without forwarded_by",
       r and "forwarded_by" not in r,
       str(r))
 
-# 写入 → 立即从任意节点读，保证读到最新值（线性化保证）
+# write, then read immediately from any node: the latest value must be visible (linearizability)
 r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v2"})
-check("更新 linear_key=v2", r and r.get("status") == "ok")
+check("update linear_key=v2", r and r.get("status") == "ok")
 for port in PORTS:
     r = http_get(port, "/get?key=linear_key")
-    check(f"节点 {port} 立即读到最新值 v2",
+    check(f"node {port} immediately reads the latest value v2",
           r and r.get("value") == "v2",
           f"value={r.get('value') if r else 'None'}")
 
 
-# ── 10. 批量写入（并发请求合并为一次 Raft round）──────────
-section("10. 批量写入（10 个并发请求）")
+# ── 10. batch writes (concurrent requests merged) ───────
+section("10. Batch writes (10 concurrent requests)")
 
 batch_results = [None] * 10
 
@@ -493,16 +493,16 @@ for th in threads:
     th.join()
 
 ok_count = sum(1 for r in batch_results if r and r.get("status") == "ok")
-check(f"10 个并发写入全部成功（{ok_count}/10）", ok_count == 10,
+check(f"all 10 concurrent writes succeeded ({ok_count}/10)", ok_count == 10,
       str([r.get("status") if r else "None" for r in batch_results]))
 
 time.sleep(0.5)
 for i in [0, 4, 9]:
     r = http_get(PORTS[0], f"/get?key=batch_k{i}")
-    check(f"batch_k{i} 写入正确", r and r.get("value") == f"batch_v{i}",
+    check(f"batch_k{i} written correctly", r and r.get("value") == f"batch_v{i}",
           f"value={r.get('value') if r else 'None'}")
 
-# 验证并发 delete 也能批处理
+# concurrent deletes must batch as well
 del_results = [None] * 5
 
 def do_batch_del(i):
@@ -515,17 +515,17 @@ for th in threads:
     th.join()
 
 del_ok = sum(1 for r in del_results if r and r.get("status") == "ok")
-check(f"5 个并发 delete 全部成功（{del_ok}/5）", del_ok == 5)
+check(f"all 5 concurrent deletes succeeded ({del_ok}/5)", del_ok == 5)
 
 time.sleep(0.5)
 r = http_get(PORTS[0], "/get?key=batch_k0")
-check("batch_k0 已被删除", r is None or "error" in (r or {}))
+check("batch_k0 was deleted", r is None or "error" in (r or {}))
 
 
 # ══════════════════════════════════════════════════════════
-#  汇总结果
+#  summary
 # ══════════════════════════════════════════════════════════
-section("测试汇总")
+section("Summary")
 stop_all()
 
 total  = len(results)
@@ -538,13 +538,13 @@ for name, ok, detail in results:
 
 print(f"\n{'─'*55}")
 if failed == 0:
-    print(f"  \033[92m🎉 全部通过：{passed}/{total}\033[0m")
+    print(f"  \033[92m🎉 all passed: {passed}/{total}\033[0m")
 else:
-    print(f"  \033[91m⚠️  {passed}/{total} 通过，{failed} 失败\033[0m")
-    print("\n  失败项：")
+    print(f"  \033[91m⚠️  {passed}/{total} passed, {failed} failed\033[0m")
+    print("\n  Failures:")
     for name, ok, detail in results:
         if not ok:
-            print(f"    • {name}：{detail}")
+            print(f"    • {name}: {detail}")
 print(f"{'─'*55}\n")
 
 sys.exit(0 if failed == 0 else 1)
