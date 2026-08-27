@@ -554,7 +554,7 @@ def maybe_snapshot(shard):
 
     SNAPSHOT_OPERATIONS.inc(shard=shard.shard_id, operation="create")
     print(f"  📸 shard {shard.shard_id} snapshot saved"
-          f"（snapshot_index={ci}，日志剩余 {len(shard.log)} 条）")
+          f" (snapshot_index={ci}, {len(shard.log)} log entries remaining)")
 
 
 # ── 2PC 锁超时清理 ─────────────────────────────────────────
@@ -1313,7 +1313,7 @@ class Handler(BaseHTTPRequestHandler):
         elif not up_to_date:
             print(f"  🚫 shard {sid}: refused {candidate_id} -- stale log"
                   f" (candidate last log ({cand_last_term}, {cand_last_index})"
-                  f" < 本节点 ({my_last_term}, {my_last_index})）")
+                  f" < this node ({my_last_term}, {my_last_index}))")
 
         self._respond(200, {"term": resp_term, "vote_granted": vote_granted})
 
@@ -1362,7 +1362,7 @@ class Handler(BaseHTTPRequestHandler):
                             # 冲突：该位置 term 不一致，截断到冲突点并拒绝
                             shard.log = shard.log[:rel_i]
                             print(f"  ⚠️  shard {sid}: prevLog conflict (index={prev_log_index}), "
-                                  f"截断至 rel_i={rel_i}")
+                                  f"truncating at rel_i={rel_i}")
                             conflict_resp = {"term": shard.term, "success": False,
                                              "conflict_index": prev_log_index}
                     # else: prev entry 超出当前日志，由下方 need_snapshot 逻辑处理

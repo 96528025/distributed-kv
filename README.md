@@ -8,8 +8,10 @@ CockroachDB and TiKV. The current version, `node_raft_sharded.py`, runs an indep
 Raft group per shard, with log snapshot compaction, two-phase commit transactions,
 quorum-validated leader reads, batch writes, and an optional write-ahead log backend.
 
-Every claim below is checked by 115 automated tests that run in CI on Python 3.12 and
-3.14, against real 3-node clusters killed with `SIGKILL` and `SIGSTOP`.
+The core v5 consensus, persistence, routing, read-quorum, transaction and observability
+paths are covered by 115 automated checks that run in CI on Python 3.12 and 3.14, against
+real 3-node clusters killed with `SIGKILL` and `SIGSTOP`. The deployment history, benchmark
+figures and load-test numbers further down are recorded results, not test-verified claims.
 
 The v1 store and its chat layer were deployed across three AWS EC2 regions (Virginia,
 Oregon, Ireland). v5 supports the same cross-machine `IP:PORT` setup and is verified
@@ -278,7 +280,7 @@ Five versions built in order, each fixing the core defect of the one before it:
 | `metrics.py` | Thread-safe counter, gauge and histogram plus Prometheus text export, standard library only, with a fixed label schema. |
 | `storage.py` | `StorageEngine` abstraction, legacy JSON backend, append-only WAL, checksum replay and atomic checkpoint. |
 | `benchmark_storage.py` | Storage microbenchmark comparing full JSON rewrite against WAL append; results in `benchmarks/storage_benchmark.md`. |
-| `docs/RAFT_CORRECTNESS.md` | The five Raft safety properties checked against the code, with a status table of what is fixed (C1/C2) and what is knowingly not (C4/C5). |
+| `docs/RAFT_CORRECTNESS.md` | Raft safety properties checked against the code, with a status table covering every case: fixed, partial and pending. |
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only reads versus quorum-validated leader reads: the failure scenarios and where ReadIndex begins. |
 | `docs/LESSON_02_TXN_LEADER_CHANGES.md` | Where prepare can safely rediscover a leader, and why phase 2 still needs durable recovery. |
 | `docs/OBSERVABILITY.md` | Phase A/B boundary, the full metric contract, cardinality notes and suggested alerts. |
@@ -376,8 +378,8 @@ additional limitations, described in the build log.
   checkpoint while holding `store_lock`. The threshold trades write amplification against
   replay length.
 - **Storage durability does not complete Raft durability** — `currentTerm` and `votedFor`
-  are persisted, but full Raft log recovery is unfinished. `docs/RAFT_CORRECTNESS.md`
-  tracks C4 and C5 as knowingly open.
+  are persisted, but full Raft log recovery is unfinished. See
+  `docs/RAFT_CORRECTNESS.md` for the complete fixed, partial and pending status.
 - **Metrics are process-local** — counters reset on restart. No Prometheus server, retention,
   dashboard, alert manager, tracing or authentication is bundled.
 - **No `/keys` endpoint** — there is no way to list all existing keys.
