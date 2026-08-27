@@ -172,14 +172,14 @@ def main():
     reps = 2 if quick else 3
 
     print("═" * 70)
-    print(f"存储后端基准：JSON 全量重写 vs WAL 追加")
-    print(f"  数据规模 scales={scales}  每点写入={n_writes}  重复={reps}  fsync={fsync}")
-    print(f"  Python {sys.version.split()[0]}  平台 {sys.platform}")
+    print(f"Storage backend benchmark: full JSON rewrite vs WAL append")
+    print(f"  scales={scales}  writes per point={n_writes}  repetitions={reps}  fsync={fsync}")
+    print(f"  Python {sys.version.split()[0]}  platform {sys.platform}")
     print("═" * 70)
 
     rows = []
     # 1) 单条写（batch=1）跨数据规模：核心对比，暴露 O(n) vs O(1)
-    print("\n[1] 单条 commit，跨数据规模（暴露 legacy 的写放大）")
+    print("\n[1] Single-record commits across data scales (exposes write amplification in the legacy backend)")
     print(f"{'backend':>7} {'scale':>7} {'thpt(ops/s)':>12} {'p50ms':>8} {'p99ms':>8} "
           f"{'recov_ms':>9} {'disk_KB':>8}")
     for scale in scales:
@@ -192,7 +192,7 @@ def main():
 
     # 2) batching 场景（固定一个中等规模）
     batch_scale = 1000 if 1000 in scales else scales[-1]
-    print(f"\n[2] batching 场景（scale={batch_scale}，每次 commit 合并 B 条）")
+    print(f"\n[2] Batching (scale={batch_scale}, B records merged per commit)")
     print(f"{'backend':>7} {'batch':>6} {'thpt(ops/s)':>12} {'p50ms':>8} {'p99ms':>8}")
     for batch in (1, 10, 50):
         for backend in ("json", "wal"):
@@ -231,7 +231,7 @@ def main():
         w.writerows(rows)
 
     print("\n" + "─" * 70)
-    print(f"✅ 原始结果已保存：")
+    print(f"✅ raw results saved:")
     print(f"   {os.path.relpath(json_path)}")
     print(f"   {os.path.relpath(csv_path)}")
     print("─" * 70)
