@@ -17,6 +17,30 @@ The v1 store and its chat layer were deployed across three AWS EC2 regions (Virg
 Oregon, Ireland). v5 supports the same cross-machine `IP:PORT` setup and is verified
 locally as a 3-node cluster.
 
+## 90-second engineering tour
+
+If you are reviewing the project quickly, these are the highest-signal entry points:
+
+| Question | Evidence |
+|---|---|
+| Does it run a real distributed protocol? | `test_raft_sharded.py` starts three OS processes, elects per-shard leaders, injects failures, and exercises replication, snapshots, transactions and recovery. |
+| Are safety claims tested rather than assumed? | `test_raft_correctness.py` maps regressions to named Raft invariants; `docs/RAFT_CORRECTNESS.md` separates fixed, partial and pending cases. |
+| Can it reject a stale read? | `test_read_quorum.py` pauses the old leader with `SIGSTOP` and verifies that it refuses to serve without a majority. |
+| Does committed state survive process crashes? | `test_wal.py` covers framed checksummed WAL replay, atomic checkpoints, torn tails, corruption and two full-cluster `SIGKILL` cycles. |
+| Are performance claims reproducible? | `benchmark_raft_sharded.py` and `benchmark_storage.py` preserve raw CSV/JSON results and document environment, variance and bottlenecks. |
+| Are design trade-offs explicit? | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) traces request paths and records failure semantics, persistence boundaries, scaling constraints and next decisions. |
+
+The shortest useful verification is:
+
+```bash
+python3 test_raft_correctness.py
+python3 test_read_quorum.py
+python3 test_wal.py
+```
+
+Those suites target the project's hardest claims. The complete six-suite CI gate is
+listed below.
+
 ---
 
 ## Verified: 115 automated checks across 6 suites, all run in CI
@@ -284,6 +308,7 @@ Five versions built in order, each fixing the core defect of the one before it:
 | `docs/LESSON_01_READ_QUORUM.md` | Leader-only reads versus quorum-validated leader reads: the failure scenarios and where ReadIndex begins. |
 | `docs/LESSON_02_TXN_LEADER_CHANGES.md` | Where prepare can safely rediscover a leader, and why phase 2 still needs durable recovery. |
 | `docs/OBSERVABILITY.md` | Phase A/B boundary, the full metric contract, cardinality notes and suggested alerts. |
+| `docs/ARCHITECTURE.md` | Request flows, failure semantics, persistence boundaries, scaling model and design trade-offs. |
 | `docs/BUILD_LOG.md` | Day-by-day development record (Chinese). |
 | `start.sh` / `start_chat.sh` | Start 3 v1 KV nodes (5001-5003) / 3 chat servers (9001-9003). |
 
