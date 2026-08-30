@@ -28,6 +28,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Verify the public surface is English-only
+        run: |
+          if git grep -n -I -P '[\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}]' -- .; then
+            echo "CJK text is not allowed on the public branch."
+            exit 1
+          fi
+
       # No pip install: the KV store and its test suite use only the standard library.
       - name: Run metrics and observability tests (9 checks)
         run: python3 -m unittest -v test_metrics.py

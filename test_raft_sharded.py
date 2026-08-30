@@ -14,7 +14,7 @@ Coverage (section numbers match the run output):
   6. Transaction lock conflict (prepare conflict -> abort)
   7. Transaction lock timeout release (waits for cleanup_loop)
   8. /delete endpoint (forwarding, idempotency, rewrite after delete)
-  9. Linearizable reads (/get routed to the leader)
+  9. Quorum-validated Leader reads (/get routed to the leader)
  10. Batch writes (10 concurrent sets + 5 concurrent deletes merged into one Raft round)
 
 This is an integration script rather than a unittest/pytest suite: the 11 sections above produce
@@ -454,8 +454,8 @@ if non_leader_del:
           r and r.get("status") == "ok" and "forwarded_by" in r, str(r))
 
 
-# ── 9. linearizable reads (routed to the leader) ────────
-section("9. Linearizable reads (/get routed to the leader)")
+# ── 9. quorum-validated Leader reads ─────────────────────
+section("9. Quorum-validated Leader reads (/get routed to the leader)")
 
 # write a key
 r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v1"})
@@ -465,7 +465,7 @@ time.sleep(0.3)
 # all three nodes must return v1; non-leaders forward to the leader
 for port in PORTS:
     r = http_get(port, "/get?key=linear_key")
-    check(f"node {port} reads linear_key = v1 (linearizable)",
+    check(f"node {port} reads linear_key = v1 through the Leader quorum barrier",
           r and r.get("value") == "v1",
           f"value={r.get('value') if r else 'None'}, forwarded_by={r.get('forwarded_by') if r else '-'}")
 
@@ -487,7 +487,8 @@ check(f"leader {leader_lk} reads directly, without forwarded_by",
       r and "forwarded_by" not in r,
       str(r))
 
-# write, then read immediately from any node: the latest value must be visible (linearizability)
+# On a healthy cluster, a write followed by a quorum-validated Leader read returns
+# the latest value. This happy-path check is not a complete linearizability proof.
 r = http_post(PORTS[0], "/set", {"key": "linear_key", "value": "v2"})
 check("update linear_key=v2", r and r.get("status") == "ok")
 for port in PORTS:
