@@ -4,9 +4,6 @@ This document tracks every correctness defect found in `node_raft_sharded.py`, t
 failure scenario that demonstrates it, the fix, the invariant the fix establishes,
 and the regression test that keeps it established.
 
-本文件记录 `node_raft_sharded.py` 里发现的每一个正确性缺陷：可复现的失败场景、
-修复、修复后成立的不变式、以及守住它的回归测试。
-
 It is written as a working log, not as a marketing document. Cases are added when
 found and completed when the corresponding PR lands.
 
@@ -51,7 +48,7 @@ bugs in this log:
 | [C6](#c6--client-timeout-reported-as-definitive-failure) | Timeout returns `500 "failed"` | *client semantics* | PR3 |
 | [C7](#c7--snapshots-break-shard-namespace-isolation) | Shard snapshot carries the whole global store | State Machine Safety | PR4 |
 | [C8](#c8--apply-is-not-ordered-by-log-index) | Apply runs outside `shard.lock` | State Machine Safety | PR4 |
-| [C9](#c9--leader-local-reads-are-not-linearizable) | Leader reads local store with no leadership confirmation | *linearizability* | PR5 |
+| [C9](#c9--leader-reads-need-full-readindex-semantics) | Quorum confirmation rejects an isolated old Leader, but there is no apply barrier | *linearizability* | **Partial: stale-Leader rejection fixed; full ReadIndex open** |
 
 ---
 
@@ -146,9 +143,6 @@ hard state on its way out (asserted by T1.10c).
 > was written under. A shard-count change fails startup rather than discarding the
 > election state of shards that fall outside the new range.
 >
-> 一个节点回复"投票通过"之前，这张票已经落盘；重启后 term 不回退；同一 term 只投一次；
-> 分片拓扑变了就拒绝启动，而不是丢掉一部分选票。
-
 **I-C1.1 is tested against SIGKILL, which proves the write reached the OS (flush),
 not that it reached the platter (fsync).** The code does call `fsync`; the test does
 not prove it. Power-loss durability is asserted by construction, not by test — the
@@ -247,8 +241,6 @@ node's history is *at* the snapshot boundary, not absent. T1.4c pins this down.
 >
 > **I-C2.2** The comparison is on *last log entry* terms, never on `currentTerm`.
 >
-> 投票方只把票投给日志不比自己旧的候选人；比较的是最后一条日志的 term，不是当前 term。
-
 I-C2.2 is called out explicitly because conflating `lastLogTerm` with `currentTerm`
 is the most common way to get this rule subtly wrong — it makes the check pass
 almost always, which looks like it works.
@@ -420,23 +412,40 @@ Pending PR4. Requires exposing `last_applied` so the property can be asserted on
 
 ---
 
-## C9 — Leader-local reads are not linearizable
+## C9 — Leader reads need full ReadIndex semantics
 
-**Not a safety property — linearizability of reads** · **Lands in PR5**
+**Not a safety property — linearizability of reads** · **Partial**
 
-### Problem
+### Fixed slice: reject an isolated old Leader
 
-`/get` forwards to the shard leader, which reads its local `store`. Three gaps:
+Before reading local state, the current Leader now sends an AppendEntries probe in its
+current term and requires acknowledgements from a majority. A Leader that has lost its
+quorum refuses the read. If a peer reports a higher term, the node persists that term and
+steps down before returning the failed barrier.
 
-1. A partitioned old leader never steps down (it only steps down on *receiving* a
-   higher term, and under partition it receives nothing), and keeps serving reads.
-2. A newly elected leader may not yet have applied entries inherited from previous
-   terms, so its `store` lags the committed state.
-3. A follower forwards to `shard.leader_id`, a cache from the last AppendEntries,
-   which may name a leader that has already been deposed.
+`test_read_quorum.py` includes a real three-process regression: it pauses the old Leader
+with `SIGSTOP`, lets the remaining majority elect a replacement and commit a newer value,
+then isolates the replacement majority. Once resumed, the old Leader must return `503`
+instead of its stale local value.
 
-### Fix / Invariant / Regression test
+This establishes only the demonstrated stale-old-Leader rejection path. It is deliberately
+described as a quorum-validated Leader read, not as complete ReadIndex or a proof of
+linearizability.
 
-Pending PR5 (ReadIndex-style: confirm leadership with a quorum, then wait until the
-current-term committed prefix is applied, then read). Requires a current-term no-op
-barrier on leader election.
+### Remaining gaps
+
+1. A newly elected Leader may not yet have applied entries inherited from previous terms,
+   so its local store can lag the committed prefix.
+2. The implementation does not append and commit a current-term no-op on election, capture
+   a read index, or wait until `last_applied` reaches that index before reading.
+3. A follower forwards to `shard.leader_id`, a cache from the last AppendEntries. A stale
+   target will now reject a read when it cannot confirm quorum, but routing can still fail
+   or retry unnecessarily.
+4. Full linearizability also depends on the open log replication, commit, durability, and
+   ordered-apply cases C3-C8.
+
+### Remaining work / invariant / regression test
+
+Complete ReadIndex semantics remain open: establish a current-term commit barrier, capture
+the committed read index after quorum confirmation, wait for `last_applied >= read_index`,
+and add history-based tests that exercise concurrent reads, writes, elections, and faults.

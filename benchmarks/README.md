@@ -1,130 +1,139 @@
-# 分片 Raft KV（v5）并发性能基准
+# Sharded Raft KV concurrency benchmark
 
-对 `node_raft_sharded.py`（哈希分片 + 每分片独立 Raft 共识组）的并发性能基准。
-脚本：[`../benchmark_raft_sharded.py`](../benchmark_raft_sharded.py)。
+This benchmark exercises `node_raft_sharded.py`, which combines hash-based
+sharding with one Raft group per shard. The driver is
+[`benchmark_raft_sharded.py`](../benchmark_raft_sharded.py).
 
 ```bash
-# 自动拉起/重启 3 节点集群，跑全部测试，产出 CSV/JSON/图
+# Start and reset a three-node cluster for each measurement, then save JSON,
+# CSV, and optional charts.
 python3 benchmark_raft_sharded.py
 
-# 快速冒烟
+# Reduced smoke run.
 python3 benchmark_raft_sharded.py --quick
 
-# 出图需要 matplotlib（可选；没装也能跑，只是不出 PNG）
+# PNG generation is optional; JSON and CSV require no third-party packages.
 python3 -m pip install matplotlib
 ```
 
-测试环境：单机（一台笔记本）跑 3 个节点进程 + 压测客户端；Python 3.14；传输为
-HTTP/1.0 + JSON。下面所有绝对数字都是**这套单机 Python 栈**下的，仅供量级参考。
+The preserved run used three node processes and the benchmark client on one
+laptop, Python 3.14, and HTTP/1.0 with JSON. Its absolute values describe this
+single-host Python configuration and should not be generalized to a multi-host
+deployment.
 
----
+The results were recorded on July 23, 2026, before the current read-quorum
+barrier was added. At the time of this run, `/get` was routed to the shard
+leader but did not pay the cost of the current quorum validation. The current
+implementation uses quorum-validated leader reads; it is not presented as a
+complete ReadIndex implementation, and this project does not claim that the
+historical read measurements establish linearizability.
 
-## 方法学（为什么这些数字可信 / 怎么来的）
+## Methodology
 
-| 决定 | 做法 | 为什么 |
+| Decision | Implementation | Rationale |
 |---|---|---|
-| **并发模型** | `ThreadPoolExecutor`，线程数 = 并发度 | 一个线程 = 一个并发客户端发阻塞 HTTP，正好对应真实客户端，也和服务端「一请求一线程」对称 |
-| **客户端库** | 纯标准库 `urllib` | 服务端是 HTTP/1.0（响应即断连），客户端连接池复用不了，用标准库更诚实、零依赖 |
-| **客户端侧 Leader 路由** | 按 key 的分片直接发给该分片当前 Leader | 去掉「随机命中 Follower 再转发」这个随机变量，数字才干净；也是真实 client 库的做法 |
-| **干净起点隔离** | 每个测量点前重启集群、清空状态文件 | 源码 `save_to_disk()` 每次提交都整体重写全量 store（O(数据量)），不清库的话「后跑的测试」被撑大的库拖慢，实测差过 6× |
-| **预热** | 每个测量点前先写一批、等每个分片选出 Leader | 把选举/冷启动排除在计时之外 |
-| **取中位数** | 对比类测试每臂重复 N 次取吞吐中位数 | 单机方差大，中位数排掉偶发尖峰 |
+| Concurrency model | `ThreadPoolExecutor`; worker count equals configured concurrency | Each worker issues blocking HTTP requests, so the pool bounds requests in flight. |
+| HTTP client | Standard-library `urllib` | The server defaults to HTTP/1.0 and closes every response, so connection pooling would not reuse persistent connections. |
+| Leader routing | Resolve each key's shard leader before a measurement and send requests directly to it | Removes follower-forwarding variability from the comparison. |
+| Starting-state isolation | Restart node processes and clear their data and snapshot files before each managed measurement | The recorded run used the default legacy JSON backend, which rewrites the full store on each commit; accumulated application data would bias later measurements. |
+| Warm-up | Write a small batch and wait for each shard to elect a leader | Excludes initial election and cold-start work from timed requests. |
+| Repetition | Run comparison arms N times and report the median-throughput run | Reduces the influence of individual single-host scheduling spikes while retaining per-run values in the raw metadata. |
 
-延迟分位（p50/p95/p99/max）来自每一个请求的端到端耗时（含建连）；
-吞吐 = 成功请求数 / 墙钟时间。
+Latency percentiles are calculated from end-to-end request durations, including
+TCP connection setup. Throughput is successful requests divided by wall-clock
+time. Raw values are available in [`results.json`](results.json) and
+[`results.csv`](results.csv).
 
----
+## Variance and scope
 
-## ⚠️ 关于方差的诚实声明（重要）
+Single-host throughput varied substantially even after repeated runs. In one
+configuration, five measurements at the same concurrency ranged from roughly
+250 to 1,400 ops/s. Relevant sources of variance include:
 
-**在单机上，这套系统的吞吐方差是本质性的，重复取中位数也压不平。** 例如同一并发度、
-同一配置，5 次测量的写吞吐能从 ~250 波动到 ~1400 ops/s。根因：
+1. Three server processes and the client thread pool compete for the same CPU.
+2. Python's GIL limits parallel execution within each process.
+3. HTTP/1.0 creates a new TCP connection and server thread for every request.
+4. Elections may place three shard leaders on one, two, or three node processes.
 
-1. 3 个服务端进程 + 压测客户端线程全挤在一台机器的 CPU 上，超额订阅；
-2. Python **GIL**：每个进程内部实际串行；
-3. **每请求新建 TCP 连接**（HTTP/1.0 无 keep-alive）；
-4. **Leader 落点随机**（选举决定），不同轮次 3 个分片 Leader 可能挤在 1 个节点，也可能散在 2~3 个节点。
+The benchmark is therefore useful for comparing paths within this environment
+and for identifying orders of magnitude. Stable absolute capacity measurements
+would require isolated hosts, controlled leader placement, repeated trials, and
+host-level resource measurements.
 
-**所以本基准的价值在于「相对结论」和「量级」，不在于某个精确的峰值吞吐。** 想要稳定、
-可复现的绝对数字，需要把 3 个节点部署到 3 台独立机器上再测。
+## Preserved results
 
----
+The run used 1,500 requests per test and five repetitions per comparison point.
 
-## 结果（1500 请求/测试，每点 5 次取中位数）
+### 1. Operation throughput and latency at concurrency 50
 
-原始数据见 [`results.json`](results.json) / [`results.csv`](results.csv)。
-
-### 1. 三种操作的吞吐与延迟（并发 50）
-
-| 操作 | 吞吐 (ops/s) | p50 | p95 | p99 | max | 说明 |
+| Operation | Throughput | p50 | p95 | p99 | max | Path measured |
 |---|---:|---:|---:|---:|---:|---|
-| **/get**（线性化读） | **~2400** | 16ms | 36ms | 124ms | 238ms | 最快：读路径无批量、无磁盘写、无 2PC，路由到 Leader 直接读内存 |
-| **/set**（批量写） | ~700 | 27ms | 149ms | 375ms | 2.0s | 中等：走批量队列 + 一次 Raft 复制 + 全量落盘 |
-| **/txn**（跨分片 2PC） | **~45** | 890ms | 2.4s | 3.1s | 6.3s | 最慢：一个事务 = 2PC prepare + 多次 Raft round + commit，往返最多；高并发下出现 abort |
+| **`/get` (historical leader-routed read)** | **~2,400 ops/s** | 16 ms | 36 ms | 124 ms | 238 ms | Direct leader routing and an in-memory read; this run predates the current quorum-validation barrier. |
+| **`/set` (batched write)** | ~700 ops/s | 27 ms | 149 ms | 375 ms | 2.0 s | Batch queue, Raft replication, and full-store persistence. |
+| **`/txn` (cross-shard 2PC)** | **~45 ops/s** | 890 ms | 2.4 s | 3.1 s | 6.3 s | Prepare and commit across participants; some requests aborted under load. |
 
-![各操作延迟分布](latency_distribution.png)
+![Latency distribution by operation](latency_distribution.png)
 
-**稳定结论：读 ≫ 写 ≫ 事务，且量级差一个数量级。** 这直接反映架构成本——
-读只需路由到 Leader 读内存；写要过批量队列 + Raft 多数派复制 + 落盘；
-事务还要叠加跨分片两阶段提交。
+In this historical run, reads were faster than writes, and transactions were
+the slowest path. The paths perform materially different work, and the read
+number does not include the quorum-validation cost in the current implementation.
 
-### 2. 批量写合并的效果
+### 2. Batch-write comparison
 
-| 场景 | 吞吐 (ops/s) | p50 | p99 |
+| Scenario | Throughput | p50 | p99 |
 |---|---:|---:|---:|
-| 串行写（并发 1，每次独占一个 Raft round） | ~190 | 5ms | 12ms |
-| 高并发写（并发 50，5ms 窗口内合并，最多 20 条/round） | ~330–650 | 22ms | 358ms |
+| Serial writes (concurrency 1; one request per Raft round) | ~190 ops/s | 5 ms | 12 ms |
+| Concurrent writes (concurrency 50; up to 20 requests per 5 ms batch window) | ~330–650 ops/s | 22 ms | 358 ms |
 
-![批量写效果](batch_effect.png)
+![Batch-write comparison](batch_effect.png)
 
-**稳定结论：批量合并把写吞吐提升约 2–3×**（源码 `BATCH_TIMEOUT=5ms`、
-`BATCH_MAX_SIZE=20`：高并发下多个 `/set` 被 `batch_loop` 攒成一次 AppendEntries，
-把「N 次 Raft round」压成「N/批大小 次」）。代价是尾延迟上升——这正是批量窗口
-`BATCH_TIMEOUT` 这个旋钮在做的吞吐/延迟权衡。串行写的 p50≈5ms / p99≈12ms 很稳定，
-可视为「一次 Raft 复制往返」的基准成本。
+Across the preserved trials, batching increased write throughput by roughly
+2–3x while increasing tail latency. `BATCH_TIMEOUT=5ms` and
+`BATCH_MAX_SIZE=20` define this throughput-versus-queueing trade-off.
 
-### 3. 写吞吐 vs 并发度
+### 3. Write throughput versus concurrency
 
-![吞吐-并发曲线](throughput_vs_concurrency.png)
+![Write throughput and p99 versus concurrency](throughput_vs_concurrency.png)
 
-低并发（1→10）时吞吐随并发上升（批量开始起效）；再往上（50/100/200）**吞吐进入
-~700–1200 ops/s 的量级并被单机 CPU/GIL 封顶，同时 p99 尾延迟明显抬高**。
-曲线在高并发段呈锯齿状不是坏数据——**是单机资源争抢主导了测量**，这本身说明：
-在这套 Python + HTTP/JSON + 单机的栈下，瓶颈是主机资源与传输层，而非共识算法本身。
+Throughput increased from concurrency 1 to 10 as requests began to batch. At
+concurrency 50, 100, and 200, throughput in repeated runs was roughly
+700–1,200 ops/s while p99 latency increased. The sawtooth shape is consistent
+with substantial single-host scheduling, connection, and leader-placement
+variance; this benchmark does not isolate the cost of any one subsystem.
 
-### 4. 分片扩展性（单机，同一 3 节点集群）
+### 4. Concentrated versus spread shards
 
-为了不掺入副本因子差异，本测试固定在同一个 3 节点集群里做（副本因子相同）：
-- **单分片**：所有 key 打到 shard 0 → 全部经过一个分片的 Leader；
-- **3 分片**：key 均匀散到 3 个分片 → 3 个分片的 Leader 并行提交。
+Both arms used the same three-node cluster and replication factor:
 
-![分片对比](shard_scalability.png)
+- **Concentrated:** every key hashes to shard 0.
+- **Spread:** keys are distributed across all three shards.
 
-**单机上没有观察到「分片带来吞吐提升」，比值常 < 1。** 原因有三，都能讲清楚：
+![Concentrated versus spread shard writes](shard_scalability.png)
 
-1. **批量深度被稀释**：把负载打散到 3 个分片，每个分片的 batch 队列只有约 1/3 深，
-   合并因子从「接近 20」掉到「几条」→ Raft round 反而变多。批量和分片在这里是**相互
-   拉扯**的：集中打一个分片时批量合并最充分。
-2. **共用一台机器的 CPU（GIL）**：3 个分片的写最终都在同一台主机上争 CPU，没有真正的并行硬件。
-3. **Leader 落点**：脚本记录了每轮「Leader 分散在几个节点上」，常见是挤在 1~2 个节点，
-   进一步退化成串行。
+The single-host run did not show a throughput gain from spreading writes; the
+ratio was often below 1. Three factors affect this result:
 
-> 分片的「并行写」收益是真实的架构优势，但它需要**多机部署 + Leader 分散到不同机器**
-> 才能体现（每个分片 Leader 用独立主机的 CPU/磁盘/网卡）。要验证它，应把 3 节点跑在
-> 3 台机器上、并做 Leader 均衡，再对比单分片 vs 3 分片。这是本基准的后续方向。
+1. Spreading requests reduces each shard's batch-queue depth, which can produce
+   smaller batches and more Raft rounds.
+2. All node processes still compete for one host's CPU and other resources.
+3. Random leader placement can concentrate shard leadership on one or two node
+   processes.
 
----
+The architecture permits shard leaders on separate machines to use separate
+host resources, but these preserved results do not validate multi-host scaling.
+That claim would require a controlled multi-host experiment with leader
+placement recorded or balanced.
 
-## 已知瓶颈（换 gRPC 的优化空间）
+## Known measurement constraints
 
-本基准测的是「Python + HTTP/1.0 + JSON」这套传输栈的性能，几个已知瓶颈：
+This benchmark measures the complete Python, HTTP/1.0, JSON, consensus, and
+storage path. It does not isolate the following costs:
 
-1. **HTTP/1.0 无 keep-alive**：每个请求新建 TCP 连接 + 新起服务端线程，建连/线程调度
-   开销占比不小 → 换 **gRPC/HTTP2 持久连接**可直接省掉这部分。
-2. **JSON 编解码 + GIL**：CPU 绑定，多核用不满 → **protobuf** 编解码更快、更省 CPU。
-3. **`save_to_disk()` 每次提交整体重写全量 store JSON**：O(数据量) 磁盘写，数据越大越慢
-   → 换 **WAL 追加写 / 增量持久化**去掉随数据量增长的成本。
-4. **批量窗口 `BATCH_TIMEOUT=5ms`** 是吞吐/延迟旋钮：调大提吞吐、加尾延迟。
+1. HTTP/1.0 connection setup and per-request server-thread creation.
+2. JSON encoding, Python execution, and GIL-related scheduling.
+3. Full-store rewrites by the legacy JSON persistence backend.
+4. Queueing introduced by the 5 ms batch window.
 
-综合看，写路径的天花板主要在传输层（HTTP/1.0+JSON）与持久化（全量重写），
-共识逻辑本身不是当前瓶颈。这也是「换 gRPC + WAL」预期能拿到的优化空间。
+Persistent HTTP/2 or gRPC connections, protobuf serialization, and the WAL
+backend are reasonable follow-up experiments, but their effect should be
+measured rather than inferred from this run.
