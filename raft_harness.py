@@ -1,19 +1,21 @@
-"""
-raft_harness.py — Raft 正确性测试用的确定性驱动工具
+"""Deterministic driver for Raft correctness tests.
 
-设计目标：**不靠调度时序赌运行结果**。
+Design goal: do not make correctness depend on scheduler timing.
 
-localhost 上没法做真网络分区，真三节点集群里选举随时在跑，term 不停变化，
-用它来测"某个候选人能不能拿到票"这类问题会变成 flaky test。所以这里的做法是：
+A localhost cluster cannot model a real network partition, and elections in a live
+three-node cluster continuously change terms. Tests such as "would this candidate
+receive a vote?" would therefore be flaky. This harness instead:
 
-  1. 起 **一个真实节点**，把选举超时调到极大（RAFT_ELECTION_TIMEOUT_*），
-     它就永远不会自己发起选举，安静地待在 follower 状态；
-  2. 由测试**手工构造 RPC** 去驱动它（扮演候选人 / Leader）；
-  3. 需要观察真实节点主动发出的 RPC 时，用 FakePeer 扮演对端并录下收到的一切。
+1. Starts one real node with a very large election timeout
+   (``RAFT_ELECTION_TIMEOUT_*``), keeping it quietly in the follower state.
+2. Drives that node with RPCs constructed explicitly by the test, acting as a
+   candidate or Leader.
+3. Uses ``FakePeer`` to emulate a peer and record outbound RPCs when the test needs
+   to observe behavior initiated by the real node.
 
-这样每个断言都对应一次确定的输入和一次确定的输出。
-
-依赖 RAFT_TEST_MODE=1 才开放的 /debug/raft 内省端点。
+Each assertion consequently has one deterministic input and one deterministic
+output. The harness relies on the ``/debug/raft`` introspection endpoint, which is
+available only when ``RAFT_TEST_MODE=1``.
 """
 
 import json
@@ -32,7 +34,7 @@ BASE   = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(BASE, "node_raft_sharded.py")
 
 
-# ── HTTP 小工具 ─────────────────────────────────────────────
+# ── HTTP helpers ────────────────────────────────────────────
 def http_get(port, path, timeout=3):
     try:
         with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as r:
@@ -42,7 +44,7 @@ def http_get(port, path, timeout=3):
 
 
 def http_get_status(port, path, timeout=3):
-    """返回 HTTP 状态码；连接失败返回 None。用来断言端点是否开放。"""
+    """Return the HTTP status, or ``None`` when the connection fails."""
     try:
         with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as r:
             return r.status
@@ -66,12 +68,12 @@ def http_post(port, path, data, timeout=3):
         return None
 
 
-# ── 构造 Raft RPC ───────────────────────────────────────────
+# ── Raft RPC construction ───────────────────────────────────
 def request_vote(port, *, term, candidate_id, last_log_term, last_log_index, shard=0):
-    """以候选人身份向真实节点发 RequestVote。
+    """Send ``RequestVote`` to a real node while acting as a candidate.
 
-    注意参数命名：last_log_term 是**候选人最后一条日志的 term**，
-    与选举用的 term（candidate 的 currentTerm）是两个不同的东西。
+    ``last_log_term`` is the term of the candidate's final log entry. It is
+    distinct from ``term``, which is the candidate's current election term.
     """
     return http_post(port, "/vote", {
         "shard_id":       shard,
@@ -84,7 +86,10 @@ def request_vote(port, *, term, candidate_id, last_log_term, last_log_index, sha
 
 def append_entries(port, *, term, leader_id, entries, commit_index,
                    log_offset=0, prev_log_index=-1, prev_log_term=0, shard=0):
-    """以 Leader 身份向真实节点发 AppendEntries（也用作心跳：entries=[]）。"""
+    """Send ``AppendEntries`` to a real node while acting as the Leader.
+
+    An empty ``entries`` list represents a heartbeat.
+    """
     return http_post(port, "/append_entries", {
         "shard_id":       shard,
         "term":           term,
@@ -103,10 +108,11 @@ def make_entries(count, term, prefix="k"):
 
 
 def last_log_tuple(dbg):
-    """从 /debug/raft 的输出算出 (lastLogTerm, lastLogIndex)。
+    """Derive ``(lastLogTerm, lastLogIndex)`` from ``/debug/raft`` output.
 
-    日志非空时取最后一条；日志被快照截空时退回快照边界 —— 这正是
-    投票双方必须用同一套算法的地方（见 C2 的 _last_log_locked）。
+    A non-empty log uses its final entry. A log emptied by compaction falls back
+    to the snapshot boundary. Both sides of a vote must follow this same rule;
+    see C2 and ``_last_log_locked``.
     """
     if dbg is None:
         return None
@@ -115,12 +121,13 @@ def last_log_tuple(dbg):
     return dbg["snapshot_term"], dbg["snapshot_index"]
 
 
-# ── 真实节点 ────────────────────────────────────────────────
+# ── Real node ───────────────────────────────────────────────
 class RealNode:
-    """一个真实的 node_raft_sharded.py 进程，带确定性计时配置。
+    """A real ``node_raft_sharded.py`` process with deterministic timing.
 
-    election_timeout=None（默认）表示"永不自发选举"，节点保持 follower，
-    完全由测试驱动。需要观察它主动竞选时，传入一个很小的区间。
+    ``election_timeout=None`` keeps the node from campaigning so the test drives
+    every state transition. Supply a short interval when a test needs to observe
+    the node initiate an election.
     """
 
     def __init__(self, port, peers, *, num_shards=1, election_timeout=None,
@@ -139,7 +146,7 @@ class RealNode:
         else:
             env.pop("RAFT_TEST_MODE", None)
         if self.num_shards is None:
-            env.pop("RAFT_NUM_SHARDS", None)   # 走默认行为：NUM_SHARDS = len(ALL_PORTS)
+            env.pop("RAFT_NUM_SHARDS", None)   # Default: NUM_SHARDS = len(ALL_PORTS)
         else:
             env["RAFT_NUM_SHARDS"] = str(self.num_shards)
         lo, hi = self.election_timeout or (99999, 99999)
@@ -166,9 +173,10 @@ class RealNode:
         raise RuntimeError(f"node {self.port} did not become ready in {timeout}s")
 
     def start_expect_exit(self, timeout=10):
-        """启动一个**预期会拒绝启动**的节点，返回退出码。
+        """Start a node expected to refuse startup and return its exit code.
 
-        用于 fail-closed 测试：节点必须明确退出，而不是带着残缺状态服务。
+        Fail-closed tests require an explicit exit instead of serving with
+        incomplete state.
         """
         self.start(wait=False)
         rc = self.proc.wait(timeout=timeout)
@@ -176,10 +184,11 @@ class RealNode:
         return rc
 
     def kill(self):
-        """SIGKILL —— 不给进程任何清理机会。
+        """Send ``SIGKILL`` without giving the process a cleanup opportunity.
 
-        这证明的是"写已经交给了操作系统"（flush），**不是**掉电安全（fsync）。
-        两者的区别在 docs/RAFT_CORRECTNESS.md 的 I-C1.1 里写清楚了。
+        This proves that a write reached the operating system via ``flush``; it
+        does not prove power-loss durability via ``fsync``. I-C1.1 in
+        ``docs/RAFT_CORRECTNESS.md`` records that distinction.
         """
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGKILL)
@@ -205,7 +214,7 @@ class RealNode:
         return self.start()
 
     def debug(self, shard=0):
-        """读 /debug/raft?shard=N，返回该分片的内部状态 dict。"""
+        """Return one shard's internal state from ``/debug/raft?shard=N``."""
         r = http_get(self.port, f"/debug/raft?shard={shard}")
         if r is None:
             return None
@@ -218,12 +227,12 @@ class RealNode:
         self.kill()
 
 
-# ── 假对端 ──────────────────────────────────────────────────
+# ── Fake peer ───────────────────────────────────────────────
 class FakePeer:
-    """扮演一个 Raft 对端：录下收到的每一个 RPC，按脚本回应。
+    """Emulate a Raft peer, recording each RPC and returning scripted replies.
 
-    PR1 只用到「录下真实节点主动发出的 RequestVote」这一个能力。
-    PR3 会用它扮演持有分歧日志的 follower。
+    PR1 only records ``RequestVote`` calls initiated by the real node. PR3 will
+    also use this peer to emulate a follower with a divergent log.
     """
 
     def __init__(self, port, *, vote_granted=False, append_success=True):
@@ -260,7 +269,7 @@ class FakePeer:
                 body = json.loads(self.rfile.read(n)) if n else {}
                 peer._record(self.path, body)
                 if self.path == "/vote":
-                    # 回同一个 term：不去干扰候选人的 term（不触发它降级）
+                    # Return the same term so the candidate does not step down.
                     resp = {"term": body.get("term", 0),
                             "vote_granted": peer.vote_granted}
                 else:
@@ -300,7 +309,7 @@ class FakePeer:
         self.stop()
 
 
-# ── 产物清理 ────────────────────────────────────────────────
+# ── Artifact cleanup ────────────────────────────────────────
 ARTIFACT_GLOBS = [
     "data_raft_sharded_*.json",
     "snapshot_*.json",

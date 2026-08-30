@@ -1,27 +1,33 @@
-"""
-benchmark_storage.py — 公平对比 legacy JSON 全量重写 vs WAL 追加 两种持久化后端
+"""Compare the legacy full-JSON rewrite backend with WAL append fairly.
 
-**只测持久化层**（这正是本次改动的部分），把 Raft/HTTP/GIL 等噪声排除在外，
-从而干净地展示：
-  - legacy JSON `save_to_disk()` 每次提交整体重写全量 store → 单次提交成本 O(数据量)；
-  - WAL append → 单次提交成本与数据量无关（O(1) 追加）。
+This benchmark isolates persistence from Raft, HTTP, and GIL-related noise. It
+demonstrates two different write-cost models:
 
-测量维度（均写入原始 JSON + CSV，按 backend + 日期区分，不覆盖已有结果）：
-  - write throughput（ops/s）
-  - p50 / p95 / p99 write latency（单次 commit 端到端）
-  - 不同数据规模（store 预置 N 条）下的表现
-  - WAL/checkpoint storage growth（落盘文件字节数）
-  - restart recovery time（storage.load() 耗时）
-  - batching 场景（每次 commit 合并 B 条）
+- The legacy JSON backend rewrites the complete store on every commit, so one
+  commit costs O(store size).
+- The WAL backend appends a record, so the steady-state cost of one commit is
+  independent of store size.
 
-运行：
-  python3 benchmark_storage.py                     # 全部规模
-  python3 benchmark_storage.py --quick             # 小规模快速冒烟
-  python3 benchmark_storage.py --quick --no-save   # 冒烟但不生成结果文件
-  python3 benchmark_storage.py --fsync             # 打开 fsync 再测一遍
-  python3 benchmark_storage.py --scales 100,1000   # 自定义数据规模
+Raw measurements are written to JSON and CSV files identified by backend and date;
+existing result files are not overwritten. Measurements include:
 
-注意：结果是「单机 Python 文件 I/O + OS 页缓存」下的量级参考；方差如实记录。
+- write throughput in operations per second;
+- p50, p95, and p99 end-to-end commit latency;
+- behavior at different preloaded store sizes;
+- WAL and checkpoint storage growth;
+- restart recovery time through ``storage.load()``; and
+- batching, with B records merged into each commit.
+
+Usage:
+
+  python3 benchmark_storage.py                     # Run every scale
+  python3 benchmark_storage.py --quick             # Run a short smoke benchmark
+  python3 benchmark_storage.py --quick --no-save   # Smoke benchmark without result files
+  python3 benchmark_storage.py --fsync             # Repeat with fsync enabled
+  python3 benchmark_storage.py --scales 100,1000   # Select store sizes
+
+Results are single-machine Python file-I/O measurements against the OS page cache;
+the raw output records their variance.
 """
 
 from __future__ import annotations
@@ -73,9 +79,9 @@ def _dir_bytes(d: str, port: int) -> int:
 
 def bench_one(backend: str, scale: int, n_writes: int, batch: int,
               fsync: bool, reps: int) -> dict:
-    """对一个 (backend, scale, batch) 组合跑 reps 次，返回聚合结果。"""
+    """Run one ``(backend, scale, batch)`` case and aggregate its repetitions."""
     rep_throughput = []
-    rep_lat = []          # 汇总所有 rep 的单次 commit 延迟
+    rep_lat = []          # Per-commit latency samples from every repetition
     rep_recovery_ms = []
     storage_bytes = 0
 
@@ -86,10 +92,10 @@ def bench_one(backend: str, scale: int, n_writes: int, batch: int,
             eng = _make_engine(backend, d, port, fsync)
             store = eng.load()
 
-            # 预置 scale 条数据（模拟“库里已经有 N 条”）——不计入计时。
-            # 用一次 baseline 落盘建立“磁盘上已有 N 条”的起点：
-            #   JSON → 一次全量重写；WAL → 一次 checkpoint（即 rotation 后的现实状态）。
-            # 这样 seeding 是 O(N) 而非 O(N^2)，且能公平反映稳态下的单次 commit 成本。
+            # Preload `scale` entries without timing the setup. One baseline write
+            # establishes the on-disk starting point: JSON performs one full rewrite,
+            # while WAL publishes one checkpoint. Seeding is therefore O(N), not
+            # O(N^2), and both backends start from a comparable steady state.
             for i in range(scale):
                 store[f"seed{i}"] = "x" * 16
             idx = scale
@@ -98,7 +104,7 @@ def bench_one(backend: str, scale: int, n_writes: int, batch: int,
             else:
                 eng.commit(store, [st.WalRecord(0, 0, 1, "set", "seed0", "x" * 16)]) if scale else None
 
-            # 计时：写 n_writes 条新数据，每 batch 条合并成一次 commit
+            # Time n_writes new records, merging each group of `batch` into one commit.
             latencies = []
             t0 = time.perf_counter()
             done = 0
@@ -113,7 +119,7 @@ def bench_one(backend: str, scale: int, n_writes: int, batch: int,
                 c0 = time.perf_counter()
                 eng.commit(store, recs)
                 c1 = time.perf_counter()
-                # 单次 commit 的延迟（batch 情况下摊到每条，便于跨 batch 比较）
+                # Amortize commit latency per record so batch sizes remain comparable.
                 per_op = (c1 - c0) * 1000.0 / b
                 latencies.extend([per_op] * b)
                 done += b
@@ -125,7 +131,7 @@ def bench_one(backend: str, scale: int, n_writes: int, batch: int,
             storage_bytes = _dir_bytes(d, port)
             eng.close()
 
-            # 恢复时间：新引擎 load()
+            # Measure recovery through a fresh engine's load path.
             r0 = time.perf_counter()
             eng2 = _make_engine(backend, d, port, fsync)
             recovered = eng2.load()
@@ -172,14 +178,14 @@ def main():
     reps = 2 if quick else 3
 
     print("═" * 70)
-    print(f"存储后端基准：JSON 全量重写 vs WAL 追加")
-    print(f"  数据规模 scales={scales}  每点写入={n_writes}  重复={reps}  fsync={fsync}")
-    print(f"  Python {sys.version.split()[0]}  平台 {sys.platform}")
+    print(f"Storage backend benchmark: full JSON rewrite vs WAL append")
+    print(f"  scales={scales}  writes per point={n_writes}  repetitions={reps}  fsync={fsync}")
+    print(f"  Python {sys.version.split()[0]}  platform {sys.platform}")
     print("═" * 70)
 
     rows = []
-    # 1) 单条写（batch=1）跨数据规模：核心对比，暴露 O(n) vs O(1)
-    print("\n[1] 单条 commit，跨数据规模（暴露 legacy 的写放大）")
+    # 1) Single-record commits across scales expose O(N) rewrite vs O(1) append.
+    print("\n[1] Single-record commits across data scales (exposes write amplification in the legacy backend)")
     print(f"{'backend':>7} {'scale':>7} {'thpt(ops/s)':>12} {'p50ms':>8} {'p99ms':>8} "
           f"{'recov_ms':>9} {'disk_KB':>8}")
     for scale in scales:
@@ -190,9 +196,9 @@ def main():
                   f"{r['p50_ms']:>8.3f} {r['p99_ms']:>8.3f} "
                   f"{r['recovery_ms_median']:>9.2f} {r['storage_bytes']/1024:>8.1f}")
 
-    # 2) batching 场景（固定一个中等规模）
+    # 2) Batching at one representative, medium store size.
     batch_scale = 1000 if 1000 in scales else scales[-1]
-    print(f"\n[2] batching 场景（scale={batch_scale}，每次 commit 合并 B 条）")
+    print(f"\n[2] Batching (scale={batch_scale}, B records merged per commit)")
     print(f"{'backend':>7} {'batch':>6} {'thpt(ops/s)':>12} {'p50ms':>8} {'p99ms':>8}")
     for batch in (1, 10, 50):
         for backend in ("json", "wal"):
@@ -205,7 +211,7 @@ def main():
         print("\n✅ benchmark smoke completed (--no-save)")
         return
 
-    # ── 保存结果（按 backend 混合，文件名带日期 + fsync 标记）──────────
+    # ── Save mixed-backend results with date and optional fsync markers. ──
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
     os.makedirs(out_dir, exist_ok=True)
     tag = date.today().isoformat() + ("_fsync" if fsync else "")
@@ -231,7 +237,7 @@ def main():
         w.writerows(rows)
 
     print("\n" + "─" * 70)
-    print(f"✅ 原始结果已保存：")
+    print(f"✅ raw results saved:")
     print(f"   {os.path.relpath(json_path)}")
     print(f"   {os.path.relpath(csv_path)}")
     print("─" * 70)

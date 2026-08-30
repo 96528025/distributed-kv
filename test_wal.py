@@ -1,28 +1,28 @@
 """
-test_wal.py — WAL + checkpoint 存储引擎测试
+test_wal.py -- WAL + checkpoint storage engine tests
 
-运行方式：
-  python3 test_wal.py                # 全部（含一个真实节点重启集成测试）
-  python3 test_wal.py --unit-only    # 只跑快速的存储层单元测试
+Usage:
+  python3 test_wal.py                # everything, including a real-node restart integration test
+  python3 test_wal.py --unit-only    # only the fast storage-layer unit tests
 
-覆盖需求列表：
-  1  set 后重启恢复
-  2  delete 后重启恢复
-  3  多 shard 恢复
-  4  batch write 恢复（一次 commit 多条）
-  5  transaction commit 恢复（多条 set 顺序 commit）
-  6  重复 replay 不产生副作用（幂等）
-  7  WAL 尾部 partial record（保留此前记录、修复尾部、后续 append 可恢复）
-  8  checksum corruption（不静默，抛错）
-  9  无效 checkpoint（不静默，抛错）
-  10 checkpoint 完成但旧 WAL 仍存在（去重、不重放）
-  11 WAL rotation 后恢复
-  12 JSON backend 兼容性
-  13 多次启动/关闭不改变数据
-  14 未 committed 的内存数据不恢复 + checkpoint applied index 恢复
-  15 真实三节点集群跨两次 SIGKILL 恢复，重启后 record index 连续
+Requirements covered:
+  1  recovery after set
+  2  recovery after delete
+  3  multi-shard recovery
+  4  batch-write recovery (several records in one commit)
+  5  transaction-commit recovery (several sets committed in order)
+  6  repeated replay has no side effects (idempotent)
+  7  partial record at the WAL tail (earlier records kept, tail repaired, later appends recoverable)
+  8  checksum corruption (raises rather than failing silently)
+  9  invalid checkpoint (raises rather than failing silently)
+  10 checkpoint published while the old WAL still holds covered records (deduplicated, not replayed)
+  11 recovery after WAL rotation
+  12 JSON backend compatibility
+  13 repeated start/stop leaves data unchanged
+  14 uncommitted in-memory data is not recovered, and the checkpoint applied index is
+  15 a real 3-node cluster recovering across two SIGKILLs, with record index continuous afterwards
 
-所有测试使用临时目录，结束后清理，不在仓库留下任何产物。
+Every test runs in a temporary directory and cleans up, leaving nothing in the repository.
 """
 
 from __future__ import annotations
@@ -62,17 +62,17 @@ def wal_engine(d: str, port: int, **kw) -> st.WalStorageEngine:
     return st.create_storage_engine(cfg)
 
 
-# ── 1. set 后重启恢复 ───────────────────────────────────────
+# ── 1. recovery after set ───────────────────────────────────
 def t_set_recovery(d):
     e = wal_engine(d, 1)
     store = e.load()
     store["name"] = "alice"; e.commit(store, [st.WalRecord(0, 0, 1, "set", "name", "alice")])
     e.close()
     store2 = wal_engine(d, 1).load()
-    check("set 后重启恢复", store2 == {"name": "alice"}, str(store2))
+    check("recovery after set", store2 == {"name": "alice"}, str(store2))
 
 
-# ── 2. delete 后重启恢复 ────────────────────────────────────
+# ── 2. recovery after delete ────────────────────────────────
 def t_delete_recovery(d):
     e = wal_engine(d, 2)
     s = e.load()
@@ -80,10 +80,10 @@ def t_delete_recovery(d):
     s.pop("k", None); e.commit(s, [st.WalRecord(0, 1, 1, "delete", "k")])
     e.close()
     s2 = wal_engine(d, 2).load()
-    check("delete 后重启恢复", s2 == {}, str(s2))
+    check("recovery after delete", s2 == {}, str(s2))
 
 
-# ── 3. 多 shard 恢复 ────────────────────────────────────────
+# ── 3. multi-shard recovery ─────────────────────────────────
 def t_multi_shard(d):
     e = wal_engine(d, 3)
     s = e.load()
@@ -92,54 +92,54 @@ def t_multi_shard(d):
     s["c"] = "3"; e.commit(s, [st.WalRecord(2, 0, 1, "set", "c", "3")])
     e.close()
     s2 = wal_engine(d, 3).load()
-    check("多 shard 恢复", s2 == {"a": "1", "b": "2", "c": "3"}, str(s2))
+    check("multi-shard recovery", s2 == {"a": "1", "b": "2", "c": "3"}, str(s2))
 
 
-# ── 4. batch write 恢复 ─────────────────────────────────────
+# ── 4. batch-write recovery ─────────────────────────────────
 def t_batch_recovery(d):
     e = wal_engine(d, 4)
     s = e.load()
     recs = [st.WalRecord(0, i, 1, "set", f"k{i}", str(i)) for i in range(20)]
     for r in recs:
         s[r.key] = r.value
-    e.commit(s, recs)   # 一次 commit 多条（模拟 batch_loop）
+    e.commit(s, recs)   # several records in one commit (mirrors batch_loop)
     e.close()
     s2 = wal_engine(d, 4).load()
-    check("batch write 恢复", s2 == {f"k{i}": str(i) for i in range(20)}, str(len(s2)))
+    check("batch-write recovery", s2 == {f"k{i}": str(i) for i in range(20)}, str(len(s2)))
 
 
-# ── 5. transaction commit 恢复 ──────────────────────────────
+# ── 5. transaction-commit recovery ──────────────────────────
 def t_txn_recovery(d):
-    # 事务提交在节点里是对每个 key 依次 _do_raft_op → 逐条 commit（单条记录）
+    # In the node, a transaction commit runs _do_raft_op per key, committing one record at a time.
     e = wal_engine(d, 5)
     s = e.load()
     for i, (k, v) in enumerate([("x", "10"), ("y", "20")]):
         s[k] = v; e.commit(s, [st.WalRecord(0, i, 1, "set", k, v)])
     e.close()
     s2 = wal_engine(d, 5).load()
-    check("transaction commit 恢复", s2 == {"x": "10", "y": "20"}, str(s2))
+    check("transaction-commit recovery", s2 == {"x": "10", "y": "20"}, str(s2))
 
 
-# ── 6. 重复 replay 幂等 ─────────────────────────────────────
+# ── 6. repeated replay is idempotent ────────────────────────
 def t_idempotent_replay(d):
     e = wal_engine(d, 6)
     s = e.load()
     s["k"] = "1"; e.commit(s, [st.WalRecord(0, 0, 1, "set", "k", "1")])
     s["k"] = "2"; e.commit(s, [st.WalRecord(0, 1, 1, "set", "k", "2")])
     e.close()
-    # 反复 load 多次，结果必须一致；再对已持久化 index 重复 commit 应被跳过
+    # Loading repeatedly must give the same result; re-committing an already-persisted index is skipped.
     for _ in range(3):
         e = wal_engine(d, 6)
         s = e.load()
-        e.commit(s, [st.WalRecord(0, 0, 1, "set", "k", "1")])   # index<=applied → skip
+        e.commit(s, [st.WalRecord(0, 0, 1, "set", "k", "1")])   # index <= applied -> skipped
         e.close()
     final = wal_engine(d, 6).load()
     wal_size = os.path.getsize(os.path.join(d, "wal_6.log"))
-    # 幂等：值仍是最新 "2"，且重复 commit 没有把旧记录再写进 WAL
-    check("重复 replay 幂等", final == {"k": "2"}, f"{final}, wal={wal_size}B")
+    # Idempotent: the value is still the latest "2", and the repeat commit did not re-append to the WAL.
+    check("repeated replay is idempotent", final == {"k": "2"}, f"{final}, wal={wal_size}B")
 
 
-# ── 7. WAL 尾部 partial record ──────────────────────────────
+# ── 7. partial record at the WAL tail ───────────────────────
 def t_partial_tail(d):
     e = wal_engine(d, 7)
     s = e.load()
@@ -149,7 +149,7 @@ def t_partial_tail(d):
     walp = os.path.join(d, "wal_7.log")
     size = os.path.getsize(walp)
     with open(walp, "r+b") as f:
-        f.truncate(size - 3)   # 砍掉最后一条的尾部 3 字节（模拟半写）
+        f.truncate(size - 3)   # chop 3 bytes off the last record (simulates a half-written tail)
     e2 = wal_engine(d, 7)
     s2 = e2.load()
     # Recovery must truncate the partial frame before future appends. Otherwise the next
@@ -161,7 +161,7 @@ def t_partial_tail(d):
     s3 = e3.load()
     e3.close()
     check(
-        "WAL 尾部 partial record 修复后仍可 append/replay",
+        "WAL tail partial record: append/replay still works after repair",
         s3 == {"a": "1", "c": "3"},
         str(s3),
     )
@@ -175,7 +175,8 @@ def t_checksum_corruption(d):
     s["b"] = "2"; e.commit(s, [st.WalRecord(0, 1, 1, "set", "b", "2")])
     e.close()
     walp = os.path.join(d, "wal_8.log")
-    # 翻转第一条记录 payload 里的一个字节：帧完整但 crc 不符 → 必须抛错，不静默
+    # Flip one byte in the first record's payload: the frame is intact but the CRC no longer matches,
+    # so this must raise rather than fail silently.
     with open(walp, "r+b") as f:
         f.seek(14)
         byte = f.read(1)
@@ -186,18 +187,18 @@ def t_checksum_corruption(d):
         wal_engine(d, 8).load()
     except st.StorageCorruptionError:
         raised = True
-    check("checksum corruption 抛错（不静默）", raised)
+    check("checksum corruption raises rather than failing silently", raised)
 
 
-# ── 9. 无效 checkpoint ──────────────────────────────────────
+# ── 9. invalid checkpoint ───────────────────────────────────
 def t_invalid_checkpoint(d):
     e = wal_engine(d, 9)
     s = e.load()
     s["a"] = "1"; e.commit(s, [st.WalRecord(0, 0, 1, "set", "a", "1")])
-    e.checkpoint(s)   # 发布一个合法 checkpoint
+    e.checkpoint(s)   # publish a valid checkpoint
     e.close()
     ckpt = os.path.join(d, "checkpoint_9.json")
-    # 破坏 checkpoint 内容（校验和不再匹配）
+    # corrupt the checkpoint contents so the checksum no longer matches
     with open(ckpt, "r+b") as f:
         data = bytearray(f.read())
         data[-5] ^= 0x01
@@ -208,63 +209,65 @@ def t_invalid_checkpoint(d):
         wal_engine(d, 9).load()
     except st.StorageCorruptionError:
         raised = True
-    check("无效 checkpoint 抛错（不静默）", raised)
+    check("invalid checkpoint raises rather than failing silently", raised)
 
 
-# ── 10. checkpoint 完成但旧 WAL 仍存在 ──────────────────────
+# ── 10. checkpoint published, old WAL still present ─────────
 def t_checkpoint_and_stale_wal(d):
-    # 手工构造“崩溃点”：checkpoint 已发布，但 WAL 还带着已被 checkpoint 覆盖的记录。
+    # Construct the crash point by hand: the checkpoint is published, but the WAL still carries records
+    # the checkpoint already covers.
     e = wal_engine(d, 10)
     s = e.load()
     for i in range(3):
         s[f"k{i}"] = str(i); e.commit(s, [st.WalRecord(0, i, 1, "set", f"k{i}", str(i))])
-    # 直接调用内部 checkpoint（发布并截断 WAL），然后再追加新记录到新 WAL
+    # Call the internal checkpoint directly (publish and truncate the WAL), then append new records.
     e.checkpoint(s)
     for i in range(3, 5):
         s[f"k{i}"] = str(i); e.commit(s, [st.WalRecord(0, i, 1, "set", f"k{i}", str(i))])
-    # 人为把旧记录再追加回 WAL（模拟“已 checkpoint 但旧记录仍在 WAL”的重叠）
+    # Re-append an old record to the WAL, recreating the overlap of a checkpointed record still in the WAL.
     with open(os.path.join(d, "wal_10.log"), "ab") as f:
         f.write(st.WalStorageEngine._encode(st.WalRecord(0, 0, 1, "set", "k0", "STALE")))
     e.close()
     s2 = wal_engine(d, 10).load()
-    # index=0 已被 checkpoint 覆盖 → 那条 STALE 必须被去重跳过，k0 仍是 "0"
+    # index=0 is already covered by the checkpoint, so the STALE record must be deduplicated and k0 stays "0".
     ok = s2 == {f"k{i}": str(i) for i in range(5)}
-    check("checkpoint 完成但旧 WAL 仍存在（去重不重放）", ok, str(s2))
+    check("checkpoint published with old WAL present (deduplicated, not replayed)", ok, str(s2))
 
 
-# ── 11. WAL rotation 后恢复 ─────────────────────────────────
+# ── 11. recovery after WAL rotation ─────────────────────────
 def t_rotation_recovery(d):
-    e = wal_engine(d, 11, rotate_records=5)   # 每 5 条触发一次 checkpoint+轮换
+    e = wal_engine(d, 11, rotate_records=5)   # checkpoint and rotate every 5 records
     s = e.load()
     for i in range(23):
-        # 契约：commit 前 store 必须已反映该条记录（节点里 apply_entry 先于 persist）
+        # Contract: the store must already reflect the record before commit (in the node, apply_entry runs
+        # before persist).
         s[f"k{i}"] = str(i)
         e.commit(s, [st.WalRecord(0, i, 1, "set", f"k{i}", str(i))])
     e.close()
-    # 轮换应已发生（checkpoint 文件存在，WAL 变小）
+    # rotation should have happened: a checkpoint file exists and the WAL shrank
     ckpt_exists = os.path.exists(os.path.join(d, "checkpoint_11.json"))
     s2 = wal_engine(d, 11).load()
     ok = ckpt_exists and s2 == {f"k{i}": str(i) for i in range(23)}
-    check("WAL rotation 后恢复", ok, f"ckpt={ckpt_exists}, n={len(s2)}")
+    check("recovery after WAL rotation", ok, f"ckpt={ckpt_exists}, n={len(s2)}")
 
 
-# ── 12. JSON backend 兼容性 ─────────────────────────────────
+# ── 12. JSON backend compatibility ──────────────────────────
 def t_json_backend(d):
     cfg = st.StorageConfig(backend="json", data_dir=d, port=12)
     e = st.create_storage_engine(cfg)
     s = e.load()
     s["a"] = "1"; s["b"] = "2"
-    e.commit(s, [st.WalRecord(0, 0, 1, "set", "a", "1")])   # JSON 后端忽略 records，全量重写
+    e.commit(s, [st.WalRecord(0, 0, 1, "set", "a", "1")])   # the JSON backend ignores records and rewrites the whole file
     e.close()
-    # 磁盘文件应是普通 json.dump(store) 格式，可被旧代码直接读
+    # The file on disk should be a plain json.dump(store), readable by the older code as-is.
     path = os.path.join(d, "data_raft_sharded_12.json")
     with open(path) as f:
         raw = json.load(f)
     s2 = st.create_storage_engine(cfg).load()
-    check("JSON backend 兼容性（格式 + 往返）", raw == {"a": "1", "b": "2"} and s2 == raw, str(s2))
+    check("JSON backend compatibility (format + round trip)", raw == {"a": "1", "b": "2"} and s2 == raw, str(s2))
 
 
-# ── 13. 多次启动/关闭不改变数据 ─────────────────────────────
+# ── 13. repeated start/stop leaves data unchanged ───────────
 def t_repeated_start_stop(d):
     e = wal_engine(d, 13)
     s = e.load()
@@ -276,7 +279,7 @@ def t_repeated_start_stop(d):
         s = e.load()
         snapshots.append(dict(s))
         e.close()
-    check("多次启动/关闭不改变数据", all(x == {"k": "v"} for x in snapshots), str(snapshots[-1]))
+    check("repeated start/stop leaves data unchanged", all(x == {"k": "v"} for x in snapshots), str(snapshots[-1]))
 
 
 # ── 14. committed-only + applied index metadata ─────────────
@@ -299,13 +302,13 @@ def t_committed_only_and_applied_index(d):
     applied = e3.applied_indices()
     e3.close()
     check(
-        "只恢复 committed 数据并保留 checkpoint applied index",
+        "only committed data is recovered, and the checkpoint applied index is preserved",
         no_ghost and final == {"durable": "yes"} and applied == {0: 7},
         f"store={final}, applied={applied}",
     )
 
 
-# ── 14. SIGKILL 后恢复（真实 3 节点集群集成测试）────────────
+# ── 15. recovery after SIGKILL (real 3-node cluster integration test) ──
 def _post(port, path, data, timeout=3.0):
     body = json.dumps(data).encode()
     req = urllib.request.Request(f"http://localhost:{port}{path}", data=body, method="POST")
@@ -359,10 +362,11 @@ def _wait_writable(ports, key="probe", tries=60):
 
 
 def _post_until_ok(port, path, data, timeout=20.0) -> bool:
-    """重试提交直到返回 status=ok（或超时）。
+    """Retry a submission until it returns status=ok, or time out.
 
-    早期集群三个分片仍在选举时，部分 Leader 转发会超时导致写失败；
-    重试保证测量前每条写都真正 committed（语义无关的健壮性等待）。
+    While the three shards are still electing, some leader forwards time out and the write fails.
+    Retrying guarantees every write is genuinely committed before measuring. This is a
+    semantics-independent robustness wait.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -374,10 +378,11 @@ def _post_until_ok(port, path, data, timeout=20.0) -> bool:
 
 
 def _wait_replicated(port, expected: dict, deleted: set, timeout=30.0) -> dict:
-    """轮询某节点 /all，直到 expected 全部就位且 deleted 全部消失（或超时）。
+    """Poll a node's /all until every expected key is present and every deleted key is gone, or time out.
 
-    这是**语义无关**的健壮性等待：写入经 Leader 转发提交后，follower 通过心跳
-    异步 apply；用轮询代替固定 sleep，消除单机高负载下的时序抖动。
+    This is a semantics-independent robustness wait: after a write commits through the leader,
+    followers apply it asynchronously via heartbeats. Polling instead of a fixed sleep removes
+    timing jitter on a loaded machine.
     """
     deadline = time.time() + timeout
     data = {}
@@ -396,10 +401,10 @@ def t_sigkill_recovery(d):
     procs = _start_cluster(d, ports)
     try:
         if not _wait_writable(ports):
-            check("SIGKILL 后恢复：集群启动", False, "cluster never became writable")
+            check("recovery after SIGKILL: cluster start", False, "cluster never became writable")
             return
-        # 写入多分片数据 + 一次 delete（覆盖 set/delete、多分片、多次写）。
-        # 每条写重试直到 committed，避免早期选举期的转发超时导致漏写。
+        # Write across shards plus one delete, covering set/delete, multiple shards and repeated writes.
+        # Each write retries until committed, so an early-election forward timeout cannot drop one.
         expected = {"probe": "1"}
         write_ok = True
         for i in range(15):
@@ -426,40 +431,41 @@ def t_sigkill_recovery(d):
         write_ok &= _post_until_ok(ports[0], "/txn", {"ops": txn_ops})
         expected.update({op["key"]: op["value"] for op in txn_ops})
         if not write_ok:
-            check("SIGKILL 前数据完整写入并复制到全部副本", False,
+            check("data fully written and replicated to every replica before SIGKILL", False,
                   "some writes never committed within timeout")
             return
 
-        # 轮询直到**所有三个副本**都完整复制到位（而非固定 sleep）。
-        # 必须等全部节点收敛：本系统不跨重启持久化 Raft log（只持久化 store + Raft 快照），
-        # 全集群崩溃后每个节点各自从自己的 WAL 恢复、不再靠 Raft 日志相互对账。
-        # 因此要确定性地验证「崩溃恢复保留已 apply 的状态」，需先确保该状态已 apply 到每个副本。
+        # Poll until all three replicas have the data, rather than sleeping a fixed amount.
+        # Every node must converge first: this system does not persist the Raft log across restarts
+        # (only the store and Raft snapshots), so after a full-cluster crash each node recovers from
+        # its own WAL and no longer reconciles through the Raft log. Verifying deterministically that
+        # crash recovery preserves applied state therefore requires that state to be applied everywhere.
         befores = {p: _wait_replicated(p, expected, deleted, timeout=30.0) for p in ports}
         all_consistent = all(
             all(b.get(k) == v for k, v in expected.items()) and "key7" not in b
             for b in befores.values()
         )
-        check("SIGKILL 前数据完整写入并复制到全部副本",
+        check("data fully written and replicated to every replica before SIGKILL",
               all_consistent,
               "; ".join(f"node{p}: {len(b)} keys, missing="
                         f"{[k for k in expected if b.get(k) != expected[k]]}"
                         for p, b in befores.items()))
 
-        # 强杀所有节点（不给 close 机会，模拟真实崩溃）
+        # SIGKILL every node, giving no chance to close, to mimic a real crash
         _kill(procs)
         procs = []
         time.sleep(1.0)
 
-        # 重启集群，验证从 WAL/checkpoint 恢复
+        # restart the cluster and verify recovery from WAL/checkpoint
         procs = _start_cluster(d, ports)
         if not _wait_writable(ports, key="probe2"):
-            check("SIGKILL 后恢复：集群重启", False, "cluster did not restart")
+            check("recovery after SIGKILL: cluster restart", False, "cluster did not restart")
             return
-        # 从另一个节点读，轮询直到恢复完成
+        # read from a different node, polling until recovery completes
         after = _wait_replicated(ports[1], expected, deleted, timeout=30.0)
         ok = all(after.get(f"key{i}") == f"val{i}" for i in range(15) if i != 7) \
             and "key7" not in after
-        check("SIGKILL 后从 WAL 恢复（多分片 + delete）", ok,
+        check("recovery from WAL after SIGKILL (multi-shard + delete)", ok,
               f"got {len(after)} keys; key7 in data={'key7' in after}")
         # Commit new data after recovery, wait until every replica has persisted it, then
         # crash the whole cluster again. This catches WAL index reuse after restart.
@@ -474,7 +480,7 @@ def t_sigkill_recovery(d):
         if not post_restart_ok or not all(
             data.get("post_restart") == "v2" for data in replicated_again.values()
         ):
-            check("重启后的新提交可复制", False, "post-restart write did not converge")
+            check("a new commit after restart replicates", False, "post-restart write did not converge")
             return
 
         _kill(procs)
@@ -485,7 +491,7 @@ def t_sigkill_recovery(d):
             ports[2], expected, deleted, timeout=30.0
         )
         check(
-            "跨两次 SIGKILL 后 WAL index 连续且重启后提交可恢复",
+            "WAL index stays continuous across two SIGKILLs and post-restart commits are recoverable",
             all(after_second_crash.get(k) == v for k, v in expected.items())
             and "key7" not in after_second_crash,
             str(after_second_crash),
@@ -494,7 +500,7 @@ def t_sigkill_recovery(d):
         _kill(procs)
 
 
-# ── 运行器 ──────────────────────────────────────────────────
+# ── runner ──────────────────────────────────────────────────
 UNIT_TESTS = [
     t_set_recovery, t_delete_recovery, t_multi_shard, t_batch_recovery,
     t_txn_recovery, t_idempotent_replay, t_partial_tail, t_checksum_corruption,
@@ -505,8 +511,8 @@ UNIT_TESTS = [
 
 def main():
     unit_only = "--unit-only" in sys.argv
-    print("\n🧪 WAL 存储引擎测试\n" + "─" * 55)
-    print("存储层单元测试：")
+    print("\n🧪 WAL storage engine tests\n" + "─" * 55)
+    print("Storage-layer unit tests:")
     for fn in UNIT_TESTS:
         d = tempfile.mkdtemp(prefix="waltest_")
         try:
@@ -517,7 +523,7 @@ def main():
             shutil.rmtree(d, ignore_errors=True)
 
     if not unit_only:
-        print("\n集成测试（真实节点 + SIGKILL）：")
+        print("\nIntegration test (real nodes + SIGKILL):")
         d = tempfile.mkdtemp(prefix="waltest_int_")
         try:
             t_sigkill_recovery(d)
@@ -530,12 +536,12 @@ def main():
     total = len(_results)
     print("\n" + "─" * 55)
     if passed == total:
-        print(f"  \033[92m🎉 全部通过：{passed}/{total}\033[0m")
+        print(f"  \033[92m🎉 all passed: {passed}/{total}\033[0m")
     else:
-        print(f"  \033[91m⚠️  {passed}/{total} 通过\033[0m")
+        print(f"  \033[91m⚠️  {passed}/{total} passed\033[0m")
         for name, ok, detail in _results:
             if not ok:
-                print(f"    • {name}：{detail}")
+                print(f"    • {name}: {detail}")
     print("─" * 55 + "\n")
     sys.exit(0 if passed == total else 1)
 

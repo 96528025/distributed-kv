@@ -12,7 +12,11 @@ __pycache__/
 *.pyc
 venv/
 
-# benchmark 运行产物（保留结果与图，忽略日志和临时集群状态）
+# Local v5 demo runtime state
+.run/
+.demo-data/
+
+# Benchmark runtime artifacts (preserve published results and charts)
 benchmarks/full_run.log
 benchmarks/node_logs/
 benchmarks/_cluster_state/
