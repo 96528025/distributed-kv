@@ -60,7 +60,7 @@ lock ordering, persistence boundaries, failure semantics and scaling constraints
 | **Verified path** | An isolated old leader refuses a read when it cannot confirm a majority in its current term. |
 | **Verified storage behavior** | The WAL restores locally applied state after process crashes, repairs a torn final frame and fails closed on interior corruption. This is not Raft-log recovery or power-loss proof. |
 | **Partial** | The read barrier closes the demonstrated stale-old-leader path but is not full ReadIndex and has no independent applied-index barrier. |
-| **Open** | Durable Raft log recovery; `nextIndex`/`matchIndex` conflict repair; the current-term commit rule; shard-scoped snapshots; ordered apply; durable request deduplication; failure-safe 2PC. |
+| **Open** | Durable Raft log recovery; `nextIndex`/`matchIndex` conflict repair; the current-term commit rule; shard-scoped snapshots; ordered apply; durable request deduplication; failure-safe 2PC; PreVote to contain the term inflation of a partitioned node. |
 
 The detailed [Raft correctness log](docs/RAFT_CORRECTNESS.md) separates completed,
 partial and pending cases. Known limitations are treated as engineering work, not hidden
@@ -100,7 +100,7 @@ internal replication endpoints do not provide authentication or transport encryp
 
 ## Verification
 
-CI runs 115 checks on Python 3.12 and 3.14. They are a deliberate mix of multi-process
+CI runs 128 checks on Python 3.12 and 3.14. They are a deliberate mix of multi-process
 integration tests, a real node driven by controlled peers and focused unit tests.
 
 | Suite | Checks | Scope |
@@ -111,6 +111,7 @@ integration tests, a real node driven by controlled peers and focused unit tests
 | [`test_metrics.py`](test_metrics.py) | 9 | Metrics primitives, bounded labels, instrumentation and a live scrape endpoint |
 | [`test_txn_routing.py`](test_txn_routing.py) | 5 | Leader hints, unreachable fallback, lock conflicts and phase-two participant routing |
 | [`test_read_quorum.py`](test_read_quorum.py) | 4 | Read-barrier logic plus a three-process isolated-old-leader regression |
+| [`test_http_contract.py`](test_http_contract.py) | 13 | Single-node election, request-body validation and `/get` query parsing |
 
 Run the same gate locally:
 
@@ -120,6 +121,7 @@ python3 test_raft_sharded.py
 python3 test_raft_correctness.py
 python3 test_txn_routing.py
 python3 test_read_quorum.py
+python3 test_http_contract.py
 python3 test_wal.py
 ```
 

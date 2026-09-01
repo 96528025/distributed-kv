@@ -61,6 +61,12 @@ jobs:
       - name: Run read-quorum suite (4 tests)
         run: python3 test_read_quorum.py
 
+      # Client-facing HTTP contract on a single-node group at port 5601: the
+      # single-node election fix, request-body validation, and /get query
+      # parsing. Runs inside its own temp data dir.
+      - name: Run HTTP contract suite (13 checks)
+        run: python3 test_http_contract.py
+
       # Storage layer: WAL framing and checksum replay, atomic checkpoint
       # publication, and a real 3-node cluster on 6301-6303 taken down twice
       # with SIGKILL. Runs entirely inside its own temp dirs.

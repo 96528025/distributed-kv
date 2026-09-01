@@ -26,7 +26,7 @@ Non-goals today:
 - Dynamic membership, shard migration or automatic leader balancing.
 - A production-compatible wire protocol, authentication or multi-tenancy.
 - Failure-safe distributed transactions.
-- A claim of complete Raft correctness while C3-C8 remain open in
+- A claim of complete Raft correctness while C3-C8 and C10 remain open in
   [`RAFT_CORRECTNESS.md`](RAFT_CORRECTNESS.md).
 
 ## System model
