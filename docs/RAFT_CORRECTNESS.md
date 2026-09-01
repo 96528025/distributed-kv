@@ -49,6 +49,7 @@ bugs in this log:
 | [C7](#c7--snapshots-break-shard-namespace-isolation) | Shard snapshot carries the whole global store | State Machine Safety | PR4 |
 | [C8](#c8--apply-is-not-ordered-by-log-index) | Apply runs outside `shard.lock` | State Machine Safety | PR4 |
 | [C9](#c9--leader-reads-need-full-readindex-semantics) | Quorum confirmation rejects an isolated old Leader, but there is no apply barrier | *linearizability* | **Partial: stale-Leader rejection fixed; full ReadIndex open** |
+| [C10](#c10--no-prevote-a-partitioned-node-inflates-its-term) | No PreVote; a partitioned node's term climbs without bound and disrupts the cluster on rejoin | *availability* | PR5 |
 
 ---
 
@@ -449,3 +450,53 @@ linearizability.
 Complete ReadIndex semantics remain open: establish a current-term commit barrier, capture
 the committed read index after quorum confirmation, wait for `last_applied >= read_index`,
 and add history-based tests that exercise concurrent reads, writes, elections, and faults.
+
+---
+
+## C10 — No PreVote: a partitioned node inflates its term
+
+**Property at risk:** none of the five safety properties. This is an *availability* defect,
+and it is recorded here because it is a real gap, not because it can corrupt data.
+
+### Problem
+
+`election_timer` starts a full election whenever a follower's timer expires. `start_election`
+increments `shard.term`, votes for itself and calls `persist_hard_state()` before it has any
+evidence that a majority is even reachable. A node that cannot reach its peers therefore
+repeats that loop indefinitely.
+
+### Failure scenario
+
+```
+node C is partitioned from A and B
+C's election timer expires    → term 8,  fsync, RequestVote to unreachable peers
+C's election timer expires    → term 9,  fsync, ...
+                              → ... unbounded
+A and B stay healthy; A remains Leader at term 7
+the partition heals
+C sends RequestVote at term N >> 7
+A and B observe the higher term → both step down → A stops serving
+```
+
+The cluster loses its Leader and must run a fresh election, even though nothing was ever
+wrong with it. This is the "disruptive server" problem the Raft paper addresses with PreVote
+(§9.6 of the extended paper).
+
+A second, smaller cost is local: each failed round performs an `fsync` of the hard state.
+A single node with no peers was observed reaching `term 528` within a few minutes.
+
+### Why this was not visible earlier
+
+The suite exercises partitions that heal quickly, so the term gap on rejoin stayed small
+enough to look like a normal election. Sustained isolation is what makes the gap large.
+
+### Remaining work / invariant / regression test
+
+Add a PreVote round: before incrementing `currentTerm`, a would-be candidate asks peers
+whether they *would* grant a vote at `currentTerm + 1`, and campaigns only if a majority
+answers yes. The invariant to establish is that **a node that cannot reach a majority never
+raises its own `currentTerm`**, so rejoining it cannot force a healthy Leader to step down.
+
+The regression should isolate a node with `SIGSTOP` on its peers, hold it long enough for
+several election timeouts, resume the cluster and assert that the original Leader keeps its
+term and leadership.
