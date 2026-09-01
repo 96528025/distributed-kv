@@ -16,6 +16,7 @@ import socketserver
 import json
 import sys
 import urllib.request
+import urllib.parse
 import threading
 import hashlib
 import time
@@ -713,6 +714,19 @@ def start_election(shard):
     RAFT_ELECTIONS.inc(shard=sid)
     print(f"\n🗳️  [shard {sid} term {term}] node {MY_PORT} started an election")
 
+    # A single-node group already holds a majority with its own vote. The vote count
+    # is otherwise only evaluated inside the per-peer RequestVote callbacks, and with
+    # no peers those never run, so such a node would campaign forever. Checking here
+    # is a no-op for a real cluster, where one vote is never a majority.
+    with shard.lock:
+        elected = (shard.role == CANDIDATE and
+                   shard.term == term and
+                   len(shard.votes_received) >= majority())
+        if elected:
+            _become_leader_locked(shard)
+    if elected:
+        return
+
     for port in PEER_PORTS:
         def request_vote(p, t, lli, llt):
             result = send_rpc(p, "/vote", {
@@ -950,7 +964,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._begin_request()
         if self.path.startswith("/get"):
-            key   = self.path.split("=")[-1]
+            # Parse the query properly rather than splitting on "=". Splitting made a
+            # key containing "=" resolve to its own suffix, and any trailing parameter
+            # (``/get?key=k&debug=1``) resolve to that parameter's value instead.
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query, keep_blank_values=True
+            )
+            key_values = query.get("key", [])
+            if len(key_values) != 1 or key_values[0] == "":
+                self._respond(400, {
+                    "error": "exactly one non-empty 'key' query parameter is required"
+                })
+                return
+            key   = key_values[0]
             sid   = get_shard(key)
             shard = shards[sid]
 
@@ -961,7 +987,10 @@ class Handler(BaseHTTPRequestHandler):
             # Followers route to the known leader, which performs the quorum barrier.
             if role != LEADER:
                 if leader is not None:
-                    result = send_get_rpc(leader, f"/get?key={key}")
+                    # Encode the key: forwarding it raw would corrupt any key
+                    # containing "&", "=" or a space on the way to the leader.
+                    forwarded = urllib.parse.urlencode({"key": key})
+                    result = send_get_rpc(leader, f"/get?{forwarded}")
                     if result is not None:
                         result["forwarded_by"] = MY_PORT
                         self._respond(200 if "value" in result else 404, result)
@@ -1061,8 +1090,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._begin_request()
-        length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length))
+        # A malformed body must produce a response. Letting json.loads raise here
+        # aborted the handler before anything was written, so the client saw the
+        # connection close with no status at all instead of a 400.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = json.loads(self.rfile.read(length))
+        except (ValueError, TypeError) as e:
+            self._respond(400, {"error": f"malformed request body: {e}"})
+            return
+        if not isinstance(body, dict):
+            self._respond(400, {"error": "request body must be a JSON object"})
+            return
 
         if   self.path == "/set":               self._handle_set(body)
         elif self.path == "/delete":            self._handle_delete(body)
@@ -1165,9 +1204,26 @@ class Handler(BaseHTTPRequestHandler):
             )
             return False, f"failed to reach majority ({len(acks)}/{majority()})"
 
+    def _require_key(self, body):
+        """Return a valid string key, or respond 400 and return ``None``.
+
+        ``get_shard`` calls ``key.encode()``, so a missing or non-string key used to
+        raise inside the handler and close the connection without any response.
+        """
+        key = body.get("key")
+        if not isinstance(key, str) or key == "":
+            self._respond(400, {"error": "'key' must be a non-empty string"})
+            return None
+        return key
+
     def _handle_set(self, body):
-        key   = body.get("key")
+        key = self._require_key(body)
+        if key is None:
+            return
         value = body.get("value")
+        if not isinstance(value, str):
+            self._respond(400, {"error": "'value' must be a string"})
+            return
         sid   = get_shard(key)
         shard = shards[sid]
 
@@ -1213,7 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(500, {"error": result[0][1] if result[0] else "timeout", "shard": sid})
 
     def _handle_delete(self, body):
-        key   = body.get("key")
+        key = self._require_key(body)
+        if key is None:
+            return
         sid   = get_shard(key)
         shard = shards[sid]
 
@@ -1639,6 +1697,24 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"  ❌ shard {sid}: transaction {txn_id} ABORT")
         self._respond(200, {"status": "ok"})
+
+    def handle_one_request(self):
+        """Guarantee a response even when a handler raises.
+
+        ``socketserver`` otherwise logs the traceback and closes the socket, so the
+        client observes a dropped connection instead of a status code and cannot tell
+        a server defect apart from a network failure. The targeted validation in
+        ``do_POST`` covers the known bad inputs; this is the backstop for the rest.
+        """
+        try:
+            super().handle_one_request()
+        except Exception as e:
+            try:
+                if not getattr(self, "_metrics_recorded", False):
+                    self._respond(500, {"error": f"internal error: {type(e).__name__}"})
+            except Exception:
+                pass   # The socket is already unusable; nothing further to report.
+            self.close_connection = True
 
     def _respond(self, code, data):
         self._record_request(code)
