@@ -15,7 +15,8 @@ injection and observability inspectable in one repository.
 
 Current scope:
 
-- A fixed three-node cluster with one Raft group per shard.
+- A fixed-membership cluster. The bundled launcher and integration suites use three
+  nodes, and each process hosts every configured shard group.
 - String `set`, `get` and `delete` operations.
 - Cross-shard multi-key writes through a deliberately limited 2PC coordinator.
 - Process-crash recovery through an optional WAL and atomic checkpoint backend.
@@ -61,7 +62,8 @@ An ordinary `set` or `delete` follows this path:
 
 1. Any node accepts the HTTP request and hashes the key to a shard.
 2. A follower forwards the request to its cached leader for that shard.
-3. The leader's per-shard batch queue groups up to 20 operations for at most 5 ms.
+3. The leader adds the operation to a per-shard queue. When the worker wakes, it drains
+   up to 20 currently queued operations into one round.
 4. Under the shard lock, the leader appends entries using its current term.
 5. Replication RPCs run concurrently to the other nodes.
 6. The request may succeed only after a majority acknowledges the round.
@@ -69,9 +71,11 @@ An ordinary `set` or `delete` follows this path:
    storage engine while holding the store lock.
 8. Waiting client requests receive the result of their shared replication round.
 
-The batch window is a deliberate throughput/latency control. It amortizes consensus and
-storage work under concurrency, while adding queueing latency and increasing tail latency.
-The benchmark records this trade-off instead of presenting one peak throughput number.
+Shared rounds amortize consensus and storage work when concurrent requests are already
+queued. `BATCH_TIMEOUT` bounds how long an idle worker waits before checking again; the
+condition variable wakes immediately when work arrives, so it is not a deliberate
+post-arrival batching delay. The benchmark records observed throughput and tail latency
+instead of presenting one peak number.
 
 ### Client outcome boundary
 

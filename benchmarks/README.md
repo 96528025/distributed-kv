@@ -83,13 +83,15 @@ number does not include the quorum-validation cost in the current implementation
 | Scenario | Throughput | p50 | p99 |
 |---|---:|---:|---:|
 | Serial writes (concurrency 1; one request per Raft round) | ~190 ops/s | 5 ms | 12 ms |
-| Concurrent writes (concurrency 50; up to 20 requests per 5 ms batch window) | ~330–650 ops/s | 22 ms | 358 ms |
+| Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~330–650 ops/s | 22 ms | 358 ms |
 
 ![Batch-write comparison](batch_effect.png)
 
-Across the preserved trials, batching increased write throughput by roughly
-2–3x while increasing tail latency. `BATCH_TIMEOUT=5ms` and
-`BATCH_MAX_SIZE=20` define this throughput-versus-queueing trade-off.
+Across the preserved trials, shared rounds under concurrent load increased write
+throughput by roughly 2–3x while increasing tail latency. `BATCH_MAX_SIZE=20` caps the
+number of queued requests drained into one round. `BATCH_TIMEOUT=5ms` is the idle
+condition wait; notification wakes the worker as soon as a request arrives, so it does
+not create a deliberate 5 ms collection window.
 
 ### 3. Write throughput versus concurrency
 
@@ -132,7 +134,7 @@ storage path. It does not isolate the following costs:
 1. HTTP/1.0 connection setup and per-request server-thread creation.
 2. JSON encoding, Python execution, and GIL-related scheduling.
 3. Full-store rewrites by the legacy JSON persistence backend.
-4. Queueing introduced by the 5 ms batch window.
+4. Queueing and shared replication rounds when concurrent requests accumulate.
 
 Persistent HTTP/2 or gRPC connections, protobuf serialization, and the WAL
 backend are reasonable follow-up experiments, but their effect should be

@@ -25,10 +25,10 @@ require a sidecar or third-party package.
 - Client-visible transaction coordinator outcomes.
 - Scrape-time term, role, commit index, log-window size, and pending transaction gauges.
 
-Phase B is complete when all five pre-existing suites (106 checks) still pass and the
-nine focused metrics checks prove the critical instrumentation paths are connected.
-The complete CI gate is therefore six suites and 115 checks on each supported Python
-version.
+Phase B is complete when the focused metrics checks prove that the critical
+instrumentation paths are connected without regressing the existing behavior. The
+current complete CI gate is seven suites and 128 checks on each supported Python version;
+nine of those checks are specific to metrics and observability.
 
 ## Metric contract
 
