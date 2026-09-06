@@ -147,12 +147,17 @@ python3 test_wal.py
 ```
 
 Six suites start and stop their own node processes and clean up their own files;
-`test_txn_routing.py` needs none. The cluster suite and the live read-quorum regression use real
-signals (`SIGSTOP`, `SIGKILL`); the WAL suite adds real on-disk corruption. The correctness suite
-starts one real node with a pinned election timeout and drives it over HTTP with hand-built RPCs
-from scripted peers. The transaction-routing, read-barrier and metrics unit tests replace
-`send_rpc` in-process with scripted responses (unreachable peers, `not_leader` hints, stale terms)
-so that each case is deterministic.
+`test_txn_routing.py` needs none. By mechanism:
+
+- `test_raft_sharded.py` runs a real three-node cluster and restarts nodes with `pkill`
+  (`SIGTERM`).
+- `test_read_quorum.py` pauses and resumes a live leader with `SIGSTOP`/`SIGCONT` in its
+  regression case; its other cases stub `send_rpc` with current-term and higher-term replies.
+- `test_raft_correctness.py` starts one real node with a pinned election timeout, drives it over
+  HTTP with hand-built RPCs from scripted peers, and `SIGKILL`s it to test what survives.
+- `test_wal.py` `SIGKILL`s a three-node cluster twice and corrupts bytes on disk.
+- `test_txn_routing.py` and `test_metrics.py` stub `send_rpc` in-process (unreachable peers,
+  `not_leader` hints); `test_http_contract.py` drives a single real node over HTTP.
 
 Every correctness defect found so far is logged in
 [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the

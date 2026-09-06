@@ -83,7 +83,7 @@ number does not include the quorum-validation cost in the current implementation
 | Scenario | Throughput | p50 | p99 |
 |---|---:|---:|---:|
 | Serial writes (concurrency 1; one request per Raft round) | ~190 ops/s | 5 ms | 12 ms |
-| Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~330–650 ops/s | 22 ms | 358 ms |
+| Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~647 ops/s median (250–1,480 across five trials) | 22 ms | 358 ms |
 
 ![Batch-write comparison](batch_effect.png)
 
