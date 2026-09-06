@@ -147,10 +147,12 @@ python3 test_wal.py
 ```
 
 Six suites start and stop their own node processes and clean up their own files;
-`test_txn_routing.py` needs none. The cluster, WAL, HTTP-contract and read-quorum suites use real
-signals and real on-disk corruption. The correctness, transaction-routing and read-barrier unit
-tests replace `send_rpc` with scripted responses (unreachable peers, `not_leader` hints, stale
-terms) so that each case is deterministic.
+`test_txn_routing.py` needs none. The cluster suite and the live read-quorum regression use real
+signals (`SIGSTOP`, `SIGKILL`); the WAL suite adds real on-disk corruption. The correctness suite
+starts one real node with a pinned election timeout and drives it over HTTP with hand-built RPCs
+from scripted peers. The transaction-routing, read-barrier and metrics unit tests replace
+`send_rpc` in-process with scripted responses (unreachable peers, `not_leader` hints, stale terms)
+so that each case is deterministic.
 
 Every correctness defect found so far is logged in
 [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the
@@ -205,8 +207,9 @@ supports two narrow observations and no capacity claim:
   leader draining up to 20 queued writes per round, not a measurement of batching alone.
 - Spreading keys over three shards did not help on one host: 373 ops/s against 725 ops/s with
   every key on one shard. A likely cause is that three server processes shared one CPU and
-  spreading traffic shrank each shard's batches; leader placement, CPU use and actual batch depth
-  were not recorded. Multi-host scaling is untested. See [`benchmarks/README.md`](benchmarks/README.md).
+  spreading traffic shrank each shard's batches. Leader placement was not controlled: the run
+  kept only the number of distinct leader hosts per trial (`leader_spread_each`), not which shard
+  led where, and CPU use and actual batch depth were not recorded. Multi-host scaling is untested. See [`benchmarks/README.md`](benchmarks/README.md).
 
 Smoke runs:
 

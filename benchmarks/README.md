@@ -98,9 +98,10 @@ not create a deliberate 5 ms collection window.
 
 ![Write throughput and p99 versus concurrency](throughput_vs_concurrency.png)
 
-Throughput increased from concurrency 1 to 10 as requests began to batch. At
-concurrency 50, 100, and 200, throughput in repeated runs was roughly
-700–1,200 ops/s while p99 latency increased. The sawtooth shape is consistent
+Throughput rose from concurrency 1 to 10 (217 -> 583 ops/s in `results.json`), which is
+consistent with requests batching, although batch depth was not recorded. At
+concurrency 50, 100, and 200 the recorded run measured 344, 373 and 339 ops/s
+while p99 latency increased. The sawtooth shape is consistent
 with substantial single-host scheduling, connection, and leader-placement
 variance; this benchmark does not isolate the cost of any one subsystem.
 
