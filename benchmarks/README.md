@@ -87,8 +87,9 @@ number does not include the quorum-validation cost in the current implementation
 
 ![Batch-write comparison](batch_effect.png)
 
-Across the preserved trials, shared rounds under concurrent load increased write
-throughput by roughly 2–3x while increasing tail latency. `BATCH_MAX_SIZE=20` caps the
+In the recorded median run, concurrent load raised write throughput 3.37x
+(192 -> 647 ops/s) while increasing tail latency; the five concurrent trials spanned
+250-1,480 ops/s, and no trial ran with batching disabled as a control. `BATCH_MAX_SIZE=20` caps the
 number of queued requests drained into one round. `BATCH_TIMEOUT=5ms` is the idle
 condition wait; notification wakes the worker as soon as a request arrives, so it does
 not create a deliberate 5 ms collection window.

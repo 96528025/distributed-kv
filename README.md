@@ -8,11 +8,13 @@ A replicated key-value store written from scratch in standard-library Python. Th
 processes talk over HTTP/JSON, keys are hashed across three independent Raft-style groups, and a
 write is acknowledged only after a majority of nodes has it. The project exists to make the hard
 parts of a distributed store visible and testable: leader election, replication, crash recovery
-through a write-ahead log, stale-read prevention, and Prometheus metrics.
+through a write-ahead log, quorum-validated reads, and Prometheus metrics.
 
-The tests do not mock failure. They `SIGSTOP` a live leader to isolate it, `SIGKILL` the whole
-cluster twice and check what comes back, and corrupt bytes on disk to confirm recovery refuses to
-guess. 128 checks in seven suites run in CI on Python 3.12 and 3.14.
+Where behavior depends on process failure, the tests use real processes: they `SIGSTOP` a live
+leader to isolate it, `SIGKILL` the whole cluster twice and check what comes back, and corrupt
+bytes on disk to confirm recovery refuses to guess. Where deterministic RPC inputs say more than
+scheduler-dependent elections, they drive one real node with scripted peers. 128 checks in seven
+suites run in CI on Python 3.12 and 3.14.
 
 ## Quick start
 
@@ -77,11 +79,14 @@ exposes the full Raft state and is served only when `RAFT_TEST_MODE=1`.
 ```mermaid
 flowchart LR
     C[Client] -->|HTTP/JSON| N[Any node]
-    N -->|MD5 key mod 3| S0[Shard 0 leader]
-    N --> S1[Shard 1 leader]
-    N --> S2[Shard 2 leader]
-    S0 & S1 & S2 -->|AppendEntries to peers| Q[Majority ack]
-    Q --> A[Apply to shared in-memory store]
+    N --> H{MD5 key mod 3}
+    H -->|0| S0[Shard 0 leader]
+    H -->|1| S1[Shard 1 leader]
+    H -->|2| S2[Shard 2 leader]
+    S0 -.-> Q
+    S1 -.-> Q
+    S2 -.-> Q
+    Q[Selected shard: AppendEntries to peers, wait for majority] --> A[Apply to shared in-memory store]
     A --> P[WAL append, periodic checkpoint]
 ```
 
@@ -141,9 +146,11 @@ python3 test_http_contract.py
 python3 test_wal.py
 ```
 
-Each suite starts and stops its own processes and cleans up its own files. Where behavior depends
-on process failure the tests use real signals and real on-disk corruption; where deterministic RPC
-inputs say more than scheduler-dependent elections, they drive a real node with scripted peers.
+Six suites start and stop their own node processes and clean up their own files;
+`test_txn_routing.py` needs none. The cluster, WAL, HTTP-contract and read-quorum suites use real
+signals and real on-disk corruption. The correctness, transaction-routing and read-barrier unit
+tests replace `send_rpc` with scripted responses (unreachable peers, `not_leader` hints, stale
+terms) so that each case is deterministic.
 
 Every correctness defect found so far is logged in
 [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the
@@ -192,11 +199,14 @@ p50/p95/p99 latency against a three-node cluster. The committed run (`benchmarks
 2026-07-23) used the JSON backend on one laptop and predates the read-quorum barrier, so it
 supports two narrow observations and no capacity claim:
 
-- Batching helped: 192 ops/s serial versus 647 ops/s at concurrency 50 in the median run, with
-  p99 rising from 12 ms to 358 ms. The five concurrent trials spanned 250-1,480 ops/s.
-- Sharding did not help on one host: keys spread over three shards ran at 373 ops/s against
-  725 ops/s on one shard, since three server processes shared one CPU and spreading traffic
-  shrank the batches. Multi-host scaling is untested. See [`benchmarks/README.md`](benchmarks/README.md).
+- Concurrency raised throughput: 192 ops/s at concurrency 1 versus 647 ops/s at concurrency 50
+  in the median run, with p99 rising from 12 ms to 358 ms. The five concurrent trials spanned
+  250-1,480 ops/s. The run has no arm with batching disabled, so the gain is consistent with the
+  leader draining up to 20 queued writes per round, not a measurement of batching alone.
+- Spreading keys over three shards did not help on one host: 373 ops/s against 725 ops/s with
+  every key on one shard. A likely cause is that three server processes shared one CPU and
+  spreading traffic shrank each shard's batches; leader placement, CPU use and actual batch depth
+  were not recorded. Multi-host scaling is untested. See [`benchmarks/README.md`](benchmarks/README.md).
 
 Smoke runs:
 
