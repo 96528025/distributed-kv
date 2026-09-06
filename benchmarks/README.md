@@ -83,12 +83,13 @@ number does not include the quorum-validation cost in the current implementation
 | Scenario | Throughput | p50 | p99 |
 |---|---:|---:|---:|
 | Serial writes (concurrency 1; one request per Raft round) | ~190 ops/s | 5 ms | 12 ms |
-| Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~330–650 ops/s | 22 ms | 358 ms |
+| Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~647 ops/s median (250–1,480 across five trials) | 22 ms | 358 ms |
 
 ![Batch-write comparison](batch_effect.png)
 
-Across the preserved trials, shared rounds under concurrent load increased write
-throughput by roughly 2–3x while increasing tail latency. `BATCH_MAX_SIZE=20` caps the
+In the recorded median run, concurrent load raised write throughput 3.37x
+(192 -> 647 ops/s) while increasing tail latency; the five concurrent trials spanned
+250-1,480 ops/s, and no trial ran with batching disabled as a control. `BATCH_MAX_SIZE=20` caps the
 number of queued requests drained into one round. `BATCH_TIMEOUT=5ms` is the idle
 condition wait; notification wakes the worker as soon as a request arrives, so it does
 not create a deliberate 5 ms collection window.
@@ -97,9 +98,10 @@ not create a deliberate 5 ms collection window.
 
 ![Write throughput and p99 versus concurrency](throughput_vs_concurrency.png)
 
-Throughput increased from concurrency 1 to 10 as requests began to batch. At
-concurrency 50, 100, and 200, throughput in repeated runs was roughly
-700–1,200 ops/s while p99 latency increased. The sawtooth shape is consistent
+Throughput rose from concurrency 1 to 10 (217 -> 583 ops/s in `results.json`), which is
+consistent with requests batching, although batch depth was not recorded. At
+concurrency 50, 100, and 200 the recorded run measured 344, 373 and 339 ops/s
+while p99 latency increased. The sawtooth shape is consistent
 with substantial single-host scheduling, connection, and leader-placement
 variance; this benchmark does not isolate the cost of any one subsystem.
 
