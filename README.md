@@ -13,7 +13,7 @@ through a write-ahead log, quorum-validated reads, and Prometheus metrics.
 Where behavior depends on process failure, the tests use real processes: they `SIGSTOP` a live
 leader to isolate it, `SIGKILL` the whole cluster twice and check what comes back, and corrupt
 bytes on disk to confirm recovery refuses to guess. Where deterministic RPC inputs say more than
-scheduler-dependent elections, they drive one real node with scripted peers. 141 checks in eight
+scheduler-dependent elections, they drive one real node with scripted peers. 146 checks in nine
 suites run in CI on Python 3.12 and 3.14.
 
 ## Quick start
@@ -67,7 +67,7 @@ exposes the full Raft state and is served only when `RAFT_TEST_MODE=1`.
 | Area | Implementation | Evidence |
 |---|---|---|
 | Sharding | `MD5(key) % 3` picks a shard; each shard is an independent Raft-style group with its own term, leader and log. Every process hosts every shard and holds the full key space | `/health` shows three leaders, often on three different nodes |
-| Elections | Randomized timeouts (1.5-3.0 s); `currentTerm` and `votedFor` are `fsync`ed and atomically renamed before any vote-dependent reply; candidates with stale logs are refused | Crash/restart, double-vote and log-freshness regressions |
+| Elections | Randomized timeouts (1.5-3.0 s) on the monotonic clock; `currentTerm` and `votedFor` are `fsync`ed and atomically renamed before any vote-dependent reply; candidates with stale logs are refused | Crash/restart, double-vote and log-freshness regressions |
 | Writes | Forwarded to the shard leader, replicated to peers in parallel, committed once a majority acknowledges. A per-shard worker drains up to 20 queued writes into one replication round | Three-process integration suite, concurrent set/delete checks |
 | Reads | Followers forward to the leader; the leader probes its peers in the current term and answers 503 unless a majority still recognizes it | Live `SIGSTOP` isolated-old-leader regression |
 | Compaction | Logs over 20 entries are compacted into a snapshot; a follower behind the retained window installs the leader's snapshot | Snapshot and follower-restart checks |
@@ -122,7 +122,7 @@ the reasoning behind each decision are in [`docs/ARCHITECTURE.md`](docs/ARCHITEC
 
 ## Verification
 
-CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 141 checks each), standard library
+CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 146 checks each), standard library
 only.
 
 | Suite | Checks | What it exercises |
@@ -134,8 +134,9 @@ only.
 | [`test_apply_order.py`](test_apply_order.py) | 13 | Every committed entry is applied once and in order: a leader applying the entry a timed-out round left behind (live, through a full-cluster `SIGKILL` restart and on the `/txn_commit` path), compaction bounded by `last_applied`, follower catch-up from its own log or a snapshot |
 | [`test_metrics.py`](test_metrics.py) | 9 | Metric primitives, thread safety, instrumentation hooks, a live scrape |
 | [`test_txn_routing.py`](test_txn_routing.py) | 5 | Prepare follows leader hints and unreachable-node fallback under one transaction ID; phase two targets the participant that prepared |
+| [`test_timers.py`](test_timers.py) | 5 | Election and transaction-lock timers follow the monotonic clock: a wall-clock step neither starts, postpones nor expires anything |
 | [`test_read_quorum.py`](test_read_quorum.py) | 4 | Barrier logic plus a live regression: pause the leader, elect a replacement, commit a newer value, isolate the majority, wake the old leader, assert 503 instead of the stale value |
-| **Total** | **141** | |
+| **Total** | **146** | |
 
 ```bash
 python3 test_metrics.py
@@ -146,10 +147,11 @@ python3 test_read_quorum.py
 python3 test_http_contract.py
 python3 test_wal.py
 python3 test_apply_order.py
+python3 test_timers.py
 ```
 
 Seven suites start and stop their own node processes and clean up their own files;
-`test_txn_routing.py` needs none. By mechanism:
+`test_txn_routing.py` and `test_timers.py` need none. By mechanism:
 
 - `test_raft_sharded.py` runs a real three-node cluster and restarts nodes with `pkill`
   (`SIGTERM`).
@@ -164,6 +166,7 @@ Seven suites start and stop their own node processes and clean up their own file
   cases drive the apply, compaction and snapshot-install paths directly.
 - `test_txn_routing.py` and `test_metrics.py` stub `send_rpc` in-process (unreachable peers,
   `not_leader` hints); `test_http_contract.py` drives a single real node over HTTP.
+- `test_timers.py` loads the node in-process and steps the wall clock with a mock.
 
 Every correctness defect found so far is logged in
 [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the

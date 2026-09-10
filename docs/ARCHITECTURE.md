@@ -164,6 +164,11 @@ while holding its shard lock or the store lock. Snapshot creation holds the appl
 its store copy is exactly the applied prefix, then revalidates the shard boundary before
 truncating. These rules limit lock hold time and avoid a shard/store lock cycle.
 
+Election timeouts and transaction-lock leases are measured with `time.monotonic()`. A
+wall-clock step, such as an NTP correction, therefore neither starts an election on a
+follower that just heard from its leader nor postpones one that is due, and it does not
+change when a lock's lease runs out.
+
 ## Scaling model and measured bottlenecks
 
 Independent shard leaders create the possibility of parallel writes, but the local

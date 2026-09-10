@@ -304,13 +304,13 @@ class ShardRaft:
         self.apply_lock   = threading.Lock()
 
         # Election timing.
-        self.last_heartbeat   = time.time()
+        self.last_heartbeat   = time.monotonic()
         self.election_timeout = new_election_timeout()
 
         # Volatile 2PC state.
         self.pending_txns = {}   # {txn_id: [{"key": ..., "value": ...}]}
         self.key_locks    = {}   # {key: txn_id}
-        self.lock_expiry  = {}   # {txn_id: expire_time}
+        self.lock_expiry  = {}   # {txn_id: time.monotonic() deadline}
 
         # Batch queue with its own condition lock, separate from shard.lock.
         self.batch_queue = []              # [{"key", "value", "op", "event", "result"}]
@@ -664,23 +664,32 @@ def install_snapshot(shard, snap, leader_commit=-1):
 
 
 # Expired 2PC lock cleanup
+def expire_txn_locks():
+    """Release every volatile transaction lock whose lease has run out.
+
+    Leases are measured on the monotonic clock, so a wall-clock step neither
+    releases a lock early nor keeps it past its lease.
+    """
+    now = time.monotonic()
+    for shard in shards:
+        with shard.lock:
+            expired = [
+                txn_id for txn_id, exp in shard.lock_expiry.items()
+                if now > exp
+            ]
+            for txn_id in expired:
+                ops = shard.pending_txns.pop(txn_id, [])
+                for op in ops:
+                    shard.key_locks.pop(op["key"], None)
+                shard.lock_expiry.pop(txn_id, None)
+                print(f"  ⏱️  shard {shard.shard_id}: transaction {txn_id} timed out; lock released")
+
+
 def txn_cleanup_loop():
     """Release expired volatile transaction locks once per second."""
     while True:
         time.sleep(1.0)
-        now = time.time()
-        for shard in shards:
-            with shard.lock:
-                expired = [
-                    txn_id for txn_id, exp in shard.lock_expiry.items()
-                    if now > exp
-                ]
-                for txn_id in expired:
-                    ops = shard.pending_txns.pop(txn_id, [])
-                    for op in ops:
-                        shard.key_locks.pop(op["key"], None)
-                    shard.lock_expiry.pop(txn_id, None)
-                    print(f"  ⏱️  shard {shard.shard_id}: transaction {txn_id} timed out; lock released")
+        expire_txn_locks()
 
 
 # Batched write loop
@@ -1014,17 +1023,25 @@ def confirm_read_quorum(shard, timeout=READ_QUORUM_TIMEOUT):
     return False
 
 
+def election_due(shard):
+    """Whether a non-leader's election timer has expired; call without ``shard.lock``.
+
+    Elapsed time is measured on the monotonic clock: a wall-clock step forward
+    must not start an election on a follower that just heard from its leader,
+    and a step backward must not postpone one.
+    """
+    with shard.lock:
+        if shard.role == LEADER:
+            return False
+        return time.monotonic() - shard.last_heartbeat > shard.election_timeout
+
+
 def election_timer():
     """Start elections for shards whose follower timers expire."""
     while True:
         time.sleep(0.1)
         for shard in shards:
-            with shard.lock:
-                is_leader = (shard.role == LEADER)
-                elapsed   = time.time() - shard.last_heartbeat
-                timeout   = shard.election_timeout
-
-            if not is_leader and elapsed > timeout:
+            if election_due(shard):
                 with shard.lock:
                     shard.election_timeout = new_election_timeout()
                 start_election(shard)
@@ -1446,7 +1463,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if vote_granted:
                 shard.voted_for      = candidate_id
-                shard.last_heartbeat = time.time()
+                shard.last_heartbeat = time.monotonic()
                 dirty                = True
             resp_term = shard.term
 
@@ -1488,7 +1505,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200, {"term": shard.term, "success": False})
                 return
 
-            shard.last_heartbeat = time.time()
+            shard.last_heartbeat = time.monotonic()
             if term > shard.term:
                 shard.term      = term
                 shard.voted_for = None
@@ -1732,7 +1749,7 @@ class Handler(BaseHTTPRequestHandler):
             for op in ops:
                 shard.key_locks[op["key"]] = txn_id
             shard.pending_txns[txn_id] = ops
-            shard.lock_expiry[txn_id]  = time.time() + 10
+            shard.lock_expiry[txn_id]  = time.monotonic() + 10
 
         print(f"  🔒 shard {sid}: transaction {txn_id} PREPARE"
               f" (keys={[op['key'] for op in ops]})")
