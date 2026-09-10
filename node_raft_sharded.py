@@ -297,6 +297,12 @@ class ShardRaft:
         self.snapshot_index = -1  # Absolute index of the last snapshot entry.
         self.snapshot_term  = 0   # Term of the last snapshot entry.
 
+        # State-machine position. Only apply_committed() and install_snapshot()
+        # move it, both under apply_lock, so a shard applies its committed prefix
+        # exactly once and in index order. Invariant: log_offset <= last_applied + 1.
+        self.last_applied = -1    # Absolute index of the last applied entry.
+        self.apply_lock   = threading.Lock()
+
         # Election timing.
         self.last_heartbeat   = time.time()
         self.election_timeout = new_election_timeout()
@@ -350,6 +356,54 @@ def refresh_state_metrics():
 # caller holds store_lock but no shard lock; lock order is store -> storage engine.
 def persist_committed(records):
     storage.commit(store, records)
+
+
+def apply_committed(shard):
+    """Apply this shard's committed entries that are not applied yet, in index order.
+
+    Leaders and followers share this path. ``apply_lock`` serializes it per shard and
+    ``last_applied`` makes it idempotent, so an index is applied once, never out of
+    order, and never skipped. A committed entry that is not in the local log yet
+    stays pending until a later call. Returns the number of entries applied.
+
+    Lock order: ``apply_lock -> shard.lock`` (held briefly, never across I/O) and
+    ``apply_lock -> store_lock -> storage engine``. Call with no lock held.
+    """
+    with shard.apply_lock:
+        with shard.lock:
+            start = shard.last_applied + 1
+            end   = min(shard.commit_index, shard.log_offset + len(shard.log) - 1)
+            if start > end:
+                return 0
+            if start < shard.log_offset:
+                # Compaction, snapshot install and recovery all keep
+                # log_offset <= last_applied + 1, so this means an invariant broke.
+                # Skipping the gap would silently drop committed writes.
+                print(f"  ⛔ shard {shard.shard_id}: entry {start} is committed but no longer "
+                      f"in the log (log_offset={shard.log_offset}); not applying past the gap")
+                return 0
+            pending = [
+                (abs_i, shard.log[abs_i - shard.log_offset])
+                for abs_i in range(start, end + 1)
+            ]
+
+        with store_lock:
+            records = []
+            for abs_i, entry in pending:
+                apply_entry(entry)
+                records.append(storage_mod.WalRecord(
+                    shard_id=shard.shard_id,
+                    index=abs_i,
+                    term=entry["term"],
+                    op=entry.get("op", "set"),
+                    key=entry["key"],
+                    value=entry.get("value"),
+                ))
+            persist_committed(records)
+
+        with shard.lock:
+            shard.last_applied = pending[-1][0]
+    return len(pending)
 
 
 def snapshot_path(shard_id):
@@ -502,6 +556,13 @@ def load_from_disk():
                         shards[sid].log_offset, applied_index + 1
                     )
 
+    # Everything below log_offset is already in the recovered store, so the applied
+    # position starts there and apply_committed() never replays or skips around it.
+    for shard in shards:
+        with shard.lock:
+            shard.last_applied = max(shard.commit_index, shard.log_offset - 1)
+            shard.commit_index = shard.last_applied
+
 
 # Shard routing
 def get_shard(key):
@@ -514,46 +575,92 @@ def get_shard(key):
 
 # Snapshot compaction
 def maybe_snapshot(shard):
-    """Compact an oversized committed log; call without ``shard.lock``."""
+    """Compact the applied prefix of an oversized log; call with no lock held.
+
+    The boundary is ``last_applied``, not ``commit_index``: an entry that is committed
+    but not applied yet must stay in the log, or it would be missing from both the log
+    and the snapshot's store. Holding ``apply_lock`` keeps the store copy at exactly
+    this shard's applied prefix and serializes snapshot writes for the shard.
+    """
     with shard.lock:
         if len(shard.log) <= SNAPSHOT_THRESHOLD:
             return
 
-    # Copy the store without holding shard.lock to avoid a lock cycle.
-    with store_lock:
-        store_copy = dict(store)
+    with shard.apply_lock:
+        # Copy the store without holding shard.lock to avoid a lock cycle.
+        with store_lock:
+            store_copy = dict(store)
 
-    with shard.lock:
-        ci  = shard.commit_index
-        lo  = shard.log_offset
-        cut = ci - lo + 1   # Number of committed entries to compact.
-        if cut <= 0 or cut > len(shard.log):
-            return
-        snap_entry = shard.log[cut - 1]
+        with shard.lock:
+            applied = shard.last_applied
+            lo      = shard.log_offset
+            cut     = applied - lo + 1   # Number of applied entries to compact.
+            if cut <= 0 or cut > len(shard.log):
+                return
+            snap_entry = shard.log[cut - 1]
 
-    # Write the snapshot without holding the shard lock.
-    fname = snapshot_path(shard.shard_id)
-    snapshot_data = {
-        "snapshot_index": ci,
-        "snapshot_term":  snap_entry["term"],
-        "log_offset":     ci + 1,
-        "store":          store_copy,
-    }
-    with open(fname, "w") as f:
-        json.dump(snapshot_data, f)
+        # Write the snapshot without holding the shard lock.
+        fname = snapshot_path(shard.shard_id)
+        snapshot_data = {
+            "snapshot_index": applied,
+            "snapshot_term":  snap_entry["term"],
+            "log_offset":     applied + 1,
+            "store":          store_copy,
+        }
+        with open(fname, "w") as f:
+            json.dump(snapshot_data, f)
 
-    # Reacquire the lock and guard against a concurrent compaction.
-    with shard.lock:
-        if shard.log_offset != lo:
-            return   # Another thread already compacted the log.
-        shard.snapshot_index = ci
-        shard.snapshot_term  = snap_entry["term"]
-        shard.log            = shard.log[cut:]
-        shard.log_offset     = ci + 1
+        # Reacquire the lock and guard against a concurrent log replacement.
+        with shard.lock:
+            if shard.log_offset != lo:
+                return   # The log window moved while the snapshot was written.
+            shard.snapshot_index = applied
+            shard.snapshot_term  = snap_entry["term"]
+            shard.log            = shard.log[cut:]
+            shard.log_offset     = applied + 1
 
     SNAPSHOT_OPERATIONS.inc(shard=shard.shard_id, operation="create")
     print(f"  📸 shard {shard.shard_id} snapshot saved"
-          f" (snapshot_index={ci}, {len(shard.log)} log entries remaining)")
+          f" (snapshot_index={applied}, {len(shard.log)} log entries remaining)")
+
+
+def install_snapshot(shard, snap, leader_commit=-1):
+    """Adopt a leader's snapshot and log tail; call with no lock held.
+
+    The leader's store covers every index below its ``log_offset``, so that is the
+    boundary adopted here (it can be ahead of the snapshot file's own index after a
+    restart). A boundary at or below ``last_applied`` is refused: this node already
+    applied that prefix, and adopting an older store would roll it back. The tail
+    entries then apply through ``apply_committed`` like any other committed entries.
+    Returns whether the snapshot was installed.
+    """
+    sid      = shard.shard_id
+    boundary = snap["log_offset"] - 1
+    with shard.apply_lock:
+        with shard.lock:
+            if boundary <= shard.last_applied:
+                return False
+        with store_lock:
+            store.update(snap["store"])
+            storage.checkpoint(store, {sid: boundary})
+        with shard.lock:
+            shard.snapshot_index = snap["snapshot_index"]
+            shard.snapshot_term  = snap["snapshot_term"]
+            shard.log_offset     = snap["log_offset"]
+            shard.log            = snap.get("tail_log", [])
+            shard.commit_index   = max(shard.commit_index, boundary, leader_commit)
+            shard.last_applied   = boundary
+        # Persist the installed snapshot locally, under apply_lock like maybe_snapshot.
+        with open(snapshot_path(sid), "w") as f:
+            json.dump({
+                "snapshot_index": snap["snapshot_index"],
+                "snapshot_term":  snap["snapshot_term"],
+                "log_offset":     snap["log_offset"],
+                "store":          snap["store"],
+            }, f)
+    SNAPSHOT_OPERATIONS.inc(shard=sid, operation="install")
+    print(f"  📥 shard {sid} installed a snapshot (applied through index {boundary})")
+    return True
 
 
 # Expired 2PC lock cleanup
@@ -605,13 +712,10 @@ def batch_loop(shard):
                 continue
 
             t = shard.term
-            base_abs = shard.log_offset + len(shard.log)
-            new_entries = []
             for item in batch:
                 entry = {"term": t, "op": item["op"], "key": item["key"]}
                 if item["op"] == "set":
                     entry["value"] = item["value"]
-                new_entries.append(entry)
                 shard.log.append(entry)
 
             last_abs = shard.log_offset + len(shard.log) - 1   # Absolute tail index.
@@ -664,20 +768,12 @@ def batch_loop(shard):
                 outcome="success",
             )
             with shard.lock:
-                shard.commit_index = last_abs
-            with store_lock:
-                records = []
-                for offset, entry in enumerate(new_entries):
-                    apply_entry(entry)
-                    records.append(storage_mod.WalRecord(
-                        shard_id=sid,
-                        index=base_abs + offset,
-                        term=t,
-                        op=entry["op"],
-                        key=entry["key"],
-                        value=entry.get("value"),
-                    ))
-                persist_committed(records)
+                # max(): a concurrent round may already have committed further.
+                shard.commit_index = max(shard.commit_index, last_abs)
+            # Apply everything the commit covers, not only this batch: an earlier round
+            # whose majority wait timed out left its entries in the log, and this
+            # commit covers them too.
+            apply_committed(shard)
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
             print(f"  🎉 shard {sid} batch committed ({len(batch)} writes)")
             for item in batch:
@@ -1036,6 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
                         "leader":         shard.leader_id,
                         "log_length":     len(shard.log),
                         "commit_index":   shard.commit_index,
+                        "last_applied":   shard.last_applied,
                         "log_offset":     shard.log_offset,
                         "snapshot_index": shard.snapshot_index,
                         "pending_txns":   len(shard.pending_txns),
@@ -1078,10 +1175,11 @@ class Handler(BaseHTTPRequestHandler):
                         "log_offset":     shard.log_offset,
                         # volatile state
                         "commit_index":   shard.commit_index,
+                        "last_applied":   shard.last_applied,
                         "leader_id":      shard.leader_id,
                         "snapshot_index": shard.snapshot_index,
                         "snapshot_term":  shard.snapshot_term,
-                        # Planned fields: last_applied, next_index, and match_index.
+                        # Planned fields: next_index and match_index.
                     }
             self._respond(200, {"node": MY_PORT, "num_shards": NUM_SHARDS, "shards": out})
 
@@ -1181,17 +1279,11 @@ class Handler(BaseHTTPRequestHandler):
                 outcome="success",
             )
             with shard.lock:
-                shard.commit_index = log_index
-            with store_lock:
-                apply_entry(entry)
-                persist_committed([storage_mod.WalRecord(
-                    shard_id=sid,
-                    index=log_index,
-                    term=t,
-                    op=op,
-                    key=key,
-                    value=value if op == "set" else None,
-                )])
+                # max(): a batch round may already have committed past this entry.
+                shard.commit_index = max(shard.commit_index, log_index)
+            # Same rule as batch_loop: apply the whole committed prefix, including
+            # entries an earlier timed-out round left in the log.
+            apply_committed(shard)
             print(f"  🎉 shard {sid} committed: {label}")
             # Trigger compaction asynchronously without delaying this request.
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
@@ -1383,7 +1475,6 @@ class Handler(BaseHTTPRequestHandler):
         new_commit = body.get("commit_index", -1)
         leader_lo  = body.get("log_offset", 0)
 
-        to_apply      = []
         need_snapshot = False
         snap_leader   = None
         prev_log_index = body.get("prev_log_index", -1)
@@ -1425,22 +1516,17 @@ class Handler(BaseHTTPRequestHandler):
             if conflict_resp is None:
                 # Synchronize the log window.
                 if entries:
-                    if leader_lo > shard.log_offset + len(shard.log):
-                        # This follower needs a snapshot to catch up.
+                    if leader_lo > shard.last_applied + 1:
+                        # The window starts after an entry this node has not applied.
+                        # Adopting it would drop that entry unapplied, so catch up from
+                        # the leader's snapshot instead.
                         need_snapshot = True
                         snap_leader   = lid
                     else:
                         shard.log        = list(entries)
                         shard.log_offset = leader_lo
 
-                # Collect newly committed entries, converting absolute indexes.
                 if not need_snapshot and new_commit > shard.commit_index:
-                    start_abs = shard.commit_index + 1
-                    end_abs   = min(new_commit + 1, len(shard.log) + shard.log_offset)
-                    for abs_i in range(start_abs, end_abs):
-                        rel_i = abs_i - shard.log_offset
-                        if 0 <= rel_i < len(shard.log):
-                            to_apply.append((abs_i, shard.log[rel_i]))
                     shard.commit_index = new_commit
 
             resp_term = shard.term
@@ -1454,50 +1540,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Perform network and disk I/O outside shard.lock.
+        success = True
         if need_snapshot:
             snap = send_rpc(snap_leader, "/install_snapshot",
                             {"shard_id": sid, "requester": MY_PORT},
                             timeout=2.0)
-            if snap and "snapshot_index" in snap:
-                with store_lock:
-                    store.update(snap["store"])
-                    storage.checkpoint(store, {sid: snap["snapshot_index"]})
-                with shard.lock:
-                    shard.snapshot_index = snap["snapshot_index"]
-                    shard.snapshot_term  = snap["snapshot_term"]
-                    shard.log_offset     = snap["log_offset"]
-                    shard.commit_index   = snap["snapshot_index"]
-                    shard.log            = snap.get("tail_log", [])
-                # Persist the installed snapshot locally.
-                fname = snapshot_path(sid)
-                with open(fname, "w") as f:
-                    json.dump({
-                        "snapshot_index": snap["snapshot_index"],
-                        "snapshot_term":  snap["snapshot_term"],
-                        "log_offset":     snap["log_offset"],
-                        "store":          snap["store"],
-                    }, f)
-                SNAPSHOT_OPERATIONS.inc(shard=sid, operation="install")
-                print(f"  📥 shard {sid} installing a snapshot from leader {snap_leader}"
-                      f" (snapshot_index={snap['snapshot_index']})")
-        elif to_apply:
-            with store_lock:
-                records = []
-                for abs_i, entry in to_apply:
-                    apply_entry(entry)
-                    records.append(storage_mod.WalRecord(
-                        shard_id=sid,
-                        index=abs_i,
-                        term=entry["term"],
-                        op=entry.get("op", "set"),
-                        key=entry["key"],
-                        value=entry.get("value"),
-                    ))
-                persist_committed(records)
+            # Acknowledge only a window this node now holds: a failed catch-up must
+            # not count toward the leader's majority.
+            success = bool(snap and "snapshot_index" in snap and
+                           install_snapshot(shard, snap, leader_commit=new_commit))
+
+        if apply_committed(shard):
             # Followers also compact logs that exceed the threshold.
             threading.Thread(target=maybe_snapshot, args=(shard,), daemon=True).start()
 
-        self._respond(200, {"term": resp_term, "success": True})
+        self._respond(200, {"term": resp_term, "success": success})
 
     def _handle_install_snapshot(self, body):
         """Return the leader's snapshot and post-snapshot log to a follower."""
