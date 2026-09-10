@@ -567,11 +567,15 @@ lacked it.
   its own index, which could move it back behind a concurrent batch.
 - `maybe_snapshot()` compacts through `last_applied`, not `commit_index`, and holds
   `apply_lock` so its store copy is exactly the applied prefix.
-- A follower adopts a leader window only if it starts at or before `last_applied + 1`;
-  otherwise it installs the leader's snapshot. `install_snapshot()` adopts the leader's
-  `log_offset - 1` as its boundary and refuses one at or below `last_applied`. A failed
-  catch-up now answers `success: false`; it used to acknowledge entries the follower did
-  not hold.
+- A follower adopts a leader window only once its applied prefix reaches it. Usually the
+  window starts past `last_applied + 1` because the leader compacted a round whose commit
+  the follower has not heard of yet. If the follower holds the entry at `prev_log_index`
+  with the matching term, it applies the prefix up to that entry from its own log, then
+  adopts the window; this relies on Log Matching at that entry, the assumption C4 already
+  names. Only a follower that lacks those entries installs the leader's snapshot.
+- `install_snapshot()` adopts the leader's `log_offset - 1` as its boundary and refuses one
+  at or below `last_applied`. A failed catch-up now answers `success: false`; it used to
+  acknowledge entries the follower did not hold.
 - Recovery starts `last_applied` at `max(commit_index, log_offset - 1)`, the prefix
   already in the recovered store.
 
@@ -592,21 +596,23 @@ Lock order: `apply_lock -> shard.lock` (brief, never across I/O) and
 
 ### Regression test
 
-`test_apply_order.py`. Nine in-process checks cover:
+`test_apply_order.py`. Ten in-process checks cover:
 
 - ordered, idempotent apply, including a later commit that applies the entry a timed-out
   round left behind;
 - a commit index ahead of the local log;
 - compaction bounded by `last_applied`;
 - snapshot install refusing to move backward, and resuming after its boundary;
-- a follower behind a compacted window installing a snapshot, and not acknowledging a
-  failed catch-up;
+- a follower that holds the entries before a window catching up from its own log;
+- a follower that lacks them installing a snapshot, and not acknowledging a failed
+  catch-up;
 - recovery from the WAL applied index.
 
 Three live three-process regressions cover:
 
 - the scenario above, followed by a full-cluster `SIGKILL` restart;
-- a lagging follower catching up through a snapshot that holds the late entry;
+- a follower restarted after missing 25 writes catching up through a snapshot that holds
+  the late entry, while the follower that kept running installs none;
 - the `/txn_commit` path.
 
 The live regressions fail on `c43c9d6`.
@@ -621,5 +627,9 @@ correct:
 - the Raft log is still not durable (C3);
 - a snapshot still carries the whole shared store (C7).
 
-Catching a follower up now takes a snapshot more often than before, because any window
-that starts past its applied prefix triggers one.
+The first version of this fix sent a follower to a snapshot whenever a window started past
+its applied prefix. That happened on almost every compaction. On a slower CI runner, the
+install outlasted the leader's 0.5 s replication timeout, so with one follower paused,
+writes lost their majority. A follower that holds the matching entry now catches up from
+its own log instead. The live regression asserts that the follower that kept running
+installs no snapshot.

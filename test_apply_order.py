@@ -177,21 +177,39 @@ class ApplyCommittedUnitTest(unittest.TestCase):
         self.assertEqual(node.store, {"x": "1", "y": "2", "z": "3"})
         self.assertEqual(node.storage.applied_indices()[0], 9)
 
-    def _follower_with_unapplied_suffix(self):
-        """A follower holding leader entries 0-4 that has applied only 0-1."""
+    def _follower_holding(self, count):
+        """A follower holding leader entries 0..count-1 that has applied only 0-1.
+
+        The leader has since committed 0-5 and compacted through 4, so its window starts
+        at index 5.
+        """
         shard = self.shard
         shard.term = 1
-        shard.log = [entry(1, f"k{i}", str(i)) for i in range(5)]
+        shard.log = [entry(1, f"k{i}", str(i)) for i in range(count)]
         shard.commit_index = 1
         self.node.apply_committed(shard)
-        # The leader has since committed 2-5 and compacted through 4.
         return {"shard_id": 0, "term": 1, "leader_id": 5712,
                 "entries": [entry(1, "k5", "5")], "commit_index": 5,
                 "log_offset": 5, "prev_log_index": 4, "prev_log_term": 1}
 
-    def test_follower_behind_a_compacted_window_installs_a_snapshot_instead_of_skipping(self):
+    def test_follower_applies_its_own_matching_prefix_before_adopting_a_later_window(self):
         node, shard = self.node, self.shard
-        body = self._follower_with_unapplied_suffix()
+        body = self._follower_holding(5)   # holds index 4, the entry before the window
+        calls = []
+        node.send_rpc = lambda port, path, *args, **kwargs: calls.append(path)
+
+        responses = self._append_entries(body)
+
+        # Before the fix the window replaced the log and entries 2-4 were never applied.
+        self.assertEqual(calls, [], "a follower holding the prefix must not need a snapshot")
+        self.assertEqual(responses, [(200, {"term": 1, "success": True})])
+        self.assertEqual((shard.last_applied, shard.log_offset), (5, 5))
+        self.assertEqual(shard.log, [entry(1, "k5", "5")])
+        self.assertEqual(node.store, {f"k{i}": str(i) for i in range(6)})
+
+    def test_follower_missing_the_entries_before_a_window_installs_a_snapshot(self):
+        node, shard = self.node, self.shard
+        body = self._follower_holding(3)   # lacks indexes 3-4
         calls = []
 
         def leader_snapshot(port, path, data, timeout=0.5):
@@ -210,13 +228,13 @@ class ApplyCommittedUnitTest(unittest.TestCase):
 
     def test_a_failed_catch_up_is_not_acknowledged(self):
         node, shard = self.node, self.shard
-        body = self._follower_with_unapplied_suffix()
+        body = self._follower_holding(3)
         node.send_rpc = lambda *args, **kwargs: None
 
         responses = self._append_entries(body)
 
         self.assertEqual(responses, [(200, {"term": 1, "success": False})])
-        self.assertEqual((shard.last_applied, len(shard.log)), (1, 5))
+        self.assertEqual((shard.last_applied, len(shard.log)), (1, 3))
 
     def test_recovery_resumes_from_the_wal_applied_index(self):
         node, shard = self.node, self.shard
@@ -250,16 +268,24 @@ class LiveApplyRegressionTest(unittest.TestCase):
 
     # ---- cluster control ----
     def _start_cluster(self):
+        for port in LIVE_PORTS:
+            self._start_node(port)
+
+    def _start_node(self, port):
         env = dict(os.environ, RAFT_TEST_MODE="1", RAFT_NUM_SHARDS="1",
                    RAFT_ELECTION_TIMEOUT_MIN="4", RAFT_ELECTION_TIMEOUT_MAX="5")
-        for port in LIVE_PORTS:
-            peers = [str(peer) for peer in LIVE_PORTS if peer != port]
-            self.processes[port] = subprocess.Popen(
-                [sys.executable, SCRIPT, str(port), *peers,
-                 "--backend=wal", f"--data-dir={self.data_dir}"],
-                cwd=BASE, env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+        peers = [str(peer) for peer in LIVE_PORTS if peer != port]
+        self.processes[port] = subprocess.Popen(
+            [sys.executable, SCRIPT, str(port), *peers,
+             "--backend=wal", f"--data-dir={self.data_dir}"],
+            cwd=BASE, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def _kill(self, port):
+        process = self.processes[port]
+        process.send_signal(signal.SIGKILL)
+        process.wait(timeout=5)
 
     def _stop_cluster(self, sig):
         for port in list(self.paused):
@@ -373,10 +399,13 @@ class LiveApplyRegressionTest(unittest.TestCase):
                              "restarted cluster did not elect a leader")
         self._assert_stores_converge(expected)
 
-    def test_lagging_follower_catches_up_through_a_snapshot_that_holds_the_late_entry(self):
+    def test_restarted_follower_catches_up_through_a_snapshot_that_holds_the_late_entry(self):
         self._leave_uncommitted_entry("a", "1")
-        lagging = self.followers[0]
-        self._pause(lagging)
+        lagging, healthy = self.followers
+        # SIGKILL rather than SIGSTOP: a paused process still receives the RPCs queued in
+        # its socket backlog when it resumes, and those can hand it the prefix without a
+        # snapshot. A restarted node has no Raft log (C3), so it must install one.
+        self._kill(lagging)
 
         expected = {"a": "1"}
         for i in range(25):   # more than SNAPSHOT_THRESHOLD (20), so the leader compacts
@@ -388,9 +417,19 @@ class LiveApplyRegressionTest(unittest.TestCase):
             "leader never compacted its log",
         )
 
-        self._resume(lagging)
+        self._start_node(lagging)
+        # One more write, so the leader's window is not empty when the restarted node
+        # joins; an empty heartbeat window carries nothing to catch up to.
+        status, body = request(self.leader, "/set", {"key": "last", "value": "x"})
+        self.assertEqual(status, 200, body)
+        expected["last"] = "x"
+
         self._assert_stores_converge(expected)
         self.assertGreaterEqual(self._snapshot_installs(lagging), 1)
+        # The follower that kept running holds the entries before every window, so it
+        # catches up from its own log. When it installed snapshots instead, an install
+        # could outlast the leader's replication timeout and writes lost their majority.
+        self.assertEqual(self._snapshot_installs(healthy), 0)
 
     def test_transaction_commit_applies_an_entry_a_timed_out_round_left_behind(self):
         self._leave_uncommitted_entry("a", "1")

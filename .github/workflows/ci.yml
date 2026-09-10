@@ -77,7 +77,7 @@ jobs:
       # idempotent apply, compaction and snapshot install, plus a real 3-node
       # cluster on 5701-5703 that pauses followers with SIGSTOP and restarts with
       # SIGKILL. Runs entirely inside its own temp dirs.
-      - name: Run apply-order suite (12 tests)
+      - name: Run apply-order suite (13 tests)
         run: python3 test_apply_order.py
 
       - name: Clean up stray node processes and test artifacts

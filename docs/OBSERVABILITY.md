@@ -27,7 +27,7 @@ require a sidecar or third-party package.
 
 Phase B is complete when the focused metrics checks prove that the critical
 instrumentation paths are connected without regressing the existing behavior. The
-current complete CI gate is eight suites and 140 checks on each supported Python version;
+current complete CI gate is eight suites and 141 checks on each supported Python version;
 nine of those checks are specific to metrics and observability.
 
 ## Metric contract

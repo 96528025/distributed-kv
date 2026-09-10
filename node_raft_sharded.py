@@ -1476,6 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
         leader_lo  = body.get("log_offset", 0)
 
         need_snapshot = False
+        catch_up      = False
         snap_leader   = None
         prev_log_index = body.get("prev_log_index", -1)
         prev_log_term  = body.get("prev_log_term", 0)
@@ -1514,19 +1515,31 @@ class Handler(BaseHTTPRequestHandler):
                 # Entries before log_offset fall within the compacted snapshot range.
 
             if conflict_resp is None:
-                # Synchronize the log window.
+                # Synchronize the log window. Adopting a window that starts after an
+                # entry this node has not applied would drop that entry unapplied.
                 if entries:
-                    if leader_lo > shard.last_applied + 1:
-                        # The window starts after an entry this node has not applied.
-                        # Adopting it would drop that entry unapplied, so catch up from
-                        # the leader's snapshot instead.
-                        need_snapshot = True
-                        snap_leader   = lid
-                    else:
+                    rel_prev   = prev_log_index - shard.log_offset
+                    holds_prev = (0 <= rel_prev < len(shard.log) and
+                                  shard.log[rel_prev]["term"] == prev_log_term)
+                    if leader_lo <= shard.last_applied + 1:
                         shard.log        = list(entries)
                         shard.log_offset = leader_lo
+                    elif holds_prev:
+                        # Usually the leader compacted a round whose commit this node
+                        # has not heard of yet. The matching entry at prev_log_index
+                        # vouches for the prefix before it (Log Matching, the assumption
+                        # C4 names), and the leader compacts only committed entries, so
+                        # apply that prefix from this log, then adopt the window.
+                        shard.commit_index = max(shard.commit_index,
+                                                 min(new_commit, prev_log_index))
+                        catch_up = True
+                    else:
+                        # The entries before the window are missing here: install the
+                        # leader's snapshot instead of skipping them.
+                        need_snapshot = True
+                        snap_leader   = lid
 
-                if not need_snapshot and new_commit > shard.commit_index:
+                if not (need_snapshot or catch_up) and new_commit > shard.commit_index:
                     shard.commit_index = new_commit
 
             resp_term = shard.term
@@ -1541,7 +1554,18 @@ class Handler(BaseHTTPRequestHandler):
 
         # Perform network and disk I/O outside shard.lock.
         success = True
-        if need_snapshot:
+        if catch_up:
+            apply_committed(shard)
+            with shard.lock:
+                # Adopt the window if the applied prefix now reaches it and the term
+                # has not moved on while the lock was released.
+                if shard.term == resp_term and leader_lo <= shard.last_applied + 1:
+                    shard.log          = list(entries)
+                    shard.log_offset   = leader_lo
+                    shard.commit_index = max(shard.commit_index, new_commit)
+                else:
+                    success = False
+        elif need_snapshot:
             snap = send_rpc(snap_leader, "/install_snapshot",
                             {"shard_id": sid, "requester": MY_PORT},
                             timeout=2.0)

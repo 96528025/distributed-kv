@@ -13,7 +13,7 @@ through a write-ahead log, quorum-validated reads, and Prometheus metrics.
 Where behavior depends on process failure, the tests use real processes: they `SIGSTOP` a live
 leader to isolate it, `SIGKILL` the whole cluster twice and check what comes back, and corrupt
 bytes on disk to confirm recovery refuses to guess. Where deterministic RPC inputs say more than
-scheduler-dependent elections, they drive one real node with scripted peers. 140 checks in eight
+scheduler-dependent elections, they drive one real node with scripted peers. 141 checks in eight
 suites run in CI on Python 3.12 and 3.14.
 
 ## Quick start
@@ -122,7 +122,7 @@ the reasoning behind each decision are in [`docs/ARCHITECTURE.md`](docs/ARCHITEC
 
 ## Verification
 
-CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 140 checks each), standard library
+CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 141 checks each), standard library
 only.
 
 | Suite | Checks | What it exercises |
@@ -131,11 +131,11 @@ only.
 | [`test_raft_correctness.py`](test_raft_correctness.py) | 24 | One real node with a pinned election timeout, driven by hand-built RPCs: term/vote survive `SIGKILL`, election restriction, snapshot-boundary comparison, fail-closed topology check |
 | [`test_wal.py`](test_wal.py) | 17 | Replay, torn tails, CRC and checkpoint corruption, rotation, idempotent replay, and a three-node cluster `SIGKILL`ed twice |
 | [`test_http_contract.py`](test_http_contract.py) | 13 | Single-node election, 400s for malformed bodies and keys, keys containing `=`, `&` and spaces |
-| [`test_apply_order.py`](test_apply_order.py) | 12 | Every committed entry is applied once and in order: a leader applying the entry a timed-out round left behind (live, through a full-cluster `SIGKILL` restart and on the `/txn_commit` path), compaction bounded by `last_applied`, snapshot install and follower catch-up |
+| [`test_apply_order.py`](test_apply_order.py) | 13 | Every committed entry is applied once and in order: a leader applying the entry a timed-out round left behind (live, through a full-cluster `SIGKILL` restart and on the `/txn_commit` path), compaction bounded by `last_applied`, follower catch-up from its own log or a snapshot |
 | [`test_metrics.py`](test_metrics.py) | 9 | Metric primitives, thread safety, instrumentation hooks, a live scrape |
 | [`test_txn_routing.py`](test_txn_routing.py) | 5 | Prepare follows leader hints and unreachable-node fallback under one transaction ID; phase two targets the participant that prepared |
 | [`test_read_quorum.py`](test_read_quorum.py) | 4 | Barrier logic plus a live regression: pause the leader, elect a replacement, commit a newer value, isolate the majority, wake the old leader, assert 503 instead of the stale value |
-| **Total** | **140** | |
+| **Total** | **141** | |
 
 ```bash
 python3 test_metrics.py
