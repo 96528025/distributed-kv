@@ -47,9 +47,10 @@ bugs in this log:
 | [C5](#c5--commitindex-advanced-by-ack-counting) | Commit counted from RPC acks, no current-term rule | Leader Completeness | PR3 |
 | [C6](#c6--client-timeout-reported-as-definitive-failure) | Timeout returns `500 "failed"` | *client semantics* | PR3 |
 | [C7](#c7--snapshots-break-shard-namespace-isolation) | Shard snapshot carries the whole global store | State Machine Safety | PR4 |
-| [C8](#c8--apply-is-not-ordered-by-log-index) | Apply runs outside `shard.lock` | State Machine Safety | PR4 |
+| [C8](#c8--apply-is-not-ordered-by-log-index) | Apply ran outside `shard.lock`, in no fixed order | State Machine Safety | **✅ with C11** |
 | [C9](#c9--leader-reads-need-full-readindex-semantics) | Quorum confirmation rejects an isolated old Leader, but there is no apply barrier | *linearizability* | **Partial: stale-Leader rejection fixed; full ReadIndex open** |
 | [C10](#c10--no-prevote-a-partitioned-node-inflates-its-term) | No PreVote; a partitioned node's term climbs without bound and disrupts the cluster on rejoin | *availability* | PR5 |
+| [C11](#c11--leader-skipped-entries-committed-by-a-later-round) | Leader committed a timed-out round's entries without applying them; a follower could skip entries behind a compacted window | State Machine Safety | **✅** |
 
 ---
 
@@ -323,10 +324,13 @@ Pending PR3.
 `commit_index` is set to the leader's log tail once a majority of AppendEntries RPCs
 returned `success`, with no `matchIndex` bookkeeping and no §5.4.2 current-term rule.
 
-The current-term rule happens to be satisfied today only because a leader never commits
-anything except entries it just appended in its own term — which is also why a new
-leader has no mechanism at all to advance commit over entries inherited from a previous
-term (a liveness gap).
+The current-term rule happens to be satisfied today only because every replication round
+ends with an entry the leader just appended in its own term. Committing that tail also
+commits every earlier entry in the window: same-term entries whose own round timed out,
+and entries inherited from a previous term. Until [C11](#c11--leader-skipped-entries-committed-by-a-later-round)
+was fixed, the leader never applied those earlier entries. A new leader still cannot
+commit inherited entries until a client write arrives, because it does not append a
+no-op on election (a liveness gap).
 
 ### Fix / Invariant / Regression test
 
@@ -406,10 +410,23 @@ it **outside** the lock. Two concurrent AppendEntries handlers for the same shar
 therefore apply entries for the same key out of log-index order, leaving a stale value
 in the state machine.
 
-### Fix / Invariant / Regression test
+### Fix
 
-Pending PR4. Requires exposing `last_applied` so the property can be asserted on the
-*applied* prefix rather than on raw logs.
+Closed together with [C11](#c11--leader-skipped-entries-committed-by-a-later-round).
+Every apply now goes through `apply_committed()`, which holds the shard's `apply_lock`
+and applies strictly upward from `last_applied + 1`, so two handlers can no longer
+interleave applies for the same shard. `last_applied` is exposed in `/health` and
+`/debug/raft`.
+
+### Invariant
+
+I-C11.1 below.
+
+### Regression test
+
+`test_apply_order.py` checks ordered and idempotent application deterministically. It
+does not race two AppendEntries handlers against each other, so the ordering guarantee
+rests on the lock, not on a stress test.
 
 ---
 
@@ -443,7 +460,7 @@ linearizability.
    target will now reject a read when it cannot confirm quorum, but routing can still fail
    or retry unnecessarily.
 4. Full linearizability also depends on the open log replication, commit, durability, and
-   ordered-apply cases C3-C8.
+   snapshot-isolation cases C3-C7.
 
 ### Remaining work / invariant / regression test
 
@@ -500,3 +517,119 @@ raises its own `currentTerm`**, so rejoining it cannot force a healthy Leader to
 The regression should isolate a node with `SIGSTOP` on its peers, hold it long enough for
 several election timeouts, resume the cluster and assert that the original Leader keeps its
 term and leadership.
+
+---
+
+## C11 — Leader skipped entries committed by a later round
+
+**Property at risk:** State Machine Safety (§5.4.3)
+
+### Problem
+
+A write enters the leader's log before it is replicated. When a round's one-second
+majority wait timed out ([C6](#c6--client-timeout-reported-as-definitive-failure)), its
+entries stayed in the log, uncommitted. The next successful round set `commit_index` to
+the new log tail, which commits the earlier entries as well, but `batch_loop` applied only
+that round's own `new_entries`, and `_do_raft_op` (the `/txn_commit` path) only its single
+entry. Followers applied the whole `(commit_index, new_commit]` range from their logs, so
+they applied the earlier entry and the leader never did.
+
+Followers had a second path to the same result. A follower replaced its log with any
+leader window that did not start past its log tail, then applied only the committed
+entries still inside the new window. Entries it had stored but not yet applied, which the
+leader had since compacted, were dropped without being applied.
+
+### Failure scenario
+
+Reproduced on `c43c9d6` with three real processes:
+
+```
+leader appends a=1; both followers are SIGSTOPped  → 500 "majority not reached (1/2)"
+followers resume; heartbeats ship a to their logs   → a in every log, uncommitted
+client writes b=2                                   → 200; commit_index = 1 covers a
+followers apply indexes 0..1                        → store {a: 1, b: 2}
+leader applies only b                               → store {b: 2}
+GET /get?key=a through the leader's quorum read     → 404
+```
+
+The divergence did not stay local. A follower that installed the leader's snapshot
+received a store without `a`, and after a full-cluster restart the leader's WAL still
+lacked it.
+
+### Fix
+
+- Each shard has `last_applied` and an `apply_lock`. `apply_committed()` is the only apply
+  path for leaders and followers: under `apply_lock` it applies
+  `(last_applied, min(commit_index, log tail)]` in index order, writes one WAL record per
+  entry, then advances `last_applied`. A committed entry that is not in the local log yet
+  waits for a later call.
+- Both leader paths only move `commit_index` forward (`max`). `_do_raft_op` used to assign
+  its own index, which could move it back behind a concurrent batch.
+- `maybe_snapshot()` compacts through `last_applied`, not `commit_index`, and holds
+  `apply_lock` so its store copy is exactly the applied prefix.
+- A follower adopts a leader window only once its applied prefix reaches it. Usually the
+  window starts past `last_applied + 1` because the leader compacted a round whose commit
+  the follower has not heard of yet. If the follower holds the entry at `prev_log_index`
+  with the matching term, it applies the prefix up to that entry from its own log, then
+  adopts the window; this relies on Log Matching at that entry, the assumption C4 already
+  names. Only a follower that lacks those entries installs the leader's snapshot.
+- `install_snapshot()` adopts the leader's `log_offset - 1` as its boundary and refuses one
+  at or below `last_applied`. A failed catch-up now answers `success: false`; it used to
+  acknowledge entries the follower did not hold.
+- Recovery starts `last_applied` at `max(commit_index, log_offset - 1)`, the prefix
+  already in the recovered store.
+
+Lock order: `apply_lock -> shard.lock` (brief, never across I/O) and
+`apply_lock -> store_lock -> storage engine`. Nothing acquires `apply_lock` while holding
+`shard.lock` or `store_lock`.
+
+### Invariant
+
+> **I-C11.1** On every node, every committed entry with index ≤ `last_applied` has been
+> applied exactly once, in index order, and apply never skips an index.
+>
+> **I-C11.2** `log_offset ≤ last_applied + 1`: an entry leaves the log only after it has
+> been applied or is covered by an installed snapshot.
+>
+> **I-C11.3** `last_applied` never decreases, including across snapshot install and
+> restart.
+
+### Regression test
+
+`test_apply_order.py`. Ten in-process checks cover:
+
+- ordered, idempotent apply, including a later commit that applies the entry a timed-out
+  round left behind;
+- a commit index ahead of the local log;
+- compaction bounded by `last_applied`;
+- snapshot install refusing to move backward, and resuming after its boundary;
+- a follower that holds the entries before a window catching up from its own log;
+- a follower that lacks them installing a snapshot, and not acknowledging a failed
+  catch-up;
+- recovery from the WAL applied index.
+
+Three live three-process regressions cover:
+
+- the scenario above, followed by a full-cluster `SIGKILL` restart;
+- a follower restarted after missing 25 writes catching up through a snapshot that holds
+  the late entry, while the follower that kept running installs none;
+- the `/txn_commit` path.
+
+The live regressions fail on `c43c9d6`.
+
+### What this does not establish
+
+C11 decides which entries a node applies, and when. It does not make replication
+correct:
+
+- the leader still ships its whole log window and followers overwrite theirs (C4);
+- commit is still counted from acks (C5);
+- the Raft log is still not durable (C3);
+- a snapshot still carries the whole shared store (C7).
+
+The first version of this fix sent a follower to a snapshot whenever a window started past
+its applied prefix. That happened on almost every compaction. On a slower CI runner, the
+install outlasted the leader's 0.5 s replication timeout, so with one follower paused,
+writes lost their majority. A follower that holds the matching entry now catches up from
+its own log instead. The live regression asserts that the follower that kept running
+installs no snapshot.

@@ -27,7 +27,7 @@ Non-goals today:
 - Dynamic membership, shard migration or automatic leader balancing.
 - A production-compatible wire protocol, authentication or multi-tenancy.
 - Failure-safe distributed transactions.
-- A claim of complete Raft correctness while C3-C8 and C10 remain open in
+- A claim of complete Raft correctness while C3-C7 and C10 remain open in
   [`RAFT_CORRECTNESS.md`](RAFT_CORRECTNESS.md).
 
 ## System model
@@ -67,8 +67,9 @@ An ordinary `set` or `delete` follows this path:
 4. Under the shard lock, the leader appends entries using its current term.
 5. Replication RPCs run concurrently to the other nodes.
 6. The request may succeed only after a majority acknowledges the round.
-7. Committed entries are applied in order to the in-memory store and passed to the selected
-   storage engine while holding the store lock.
+7. Every committed entry not yet applied, including any an earlier timed-out round left in
+   the log, is applied in index order to the in-memory store and passed to the selected
+   storage engine; `last_applied` records how far apply has reached (C11).
 8. Waiting client requests receive the result of their shared replication round.
 
 Shared rounds amortize consensus and storage work when concurrent requests are already
@@ -122,7 +123,7 @@ and must not be conflated.
 | Artifact | Durable state | Purpose | Current boundary |
 |---|---|---|---|
 | Raft hard state | `currentTerm`, `votedFor` per shard | Prevent double voting across restarts | Full Raft log durability is still open (C3). |
-| Raft snapshot | Compacted log boundary and state used for follower catch-up | Bound in-memory log growth | Snapshot isolation and apply ordering still have tracked follow-ups. |
+| Raft snapshot | Compacted log boundary and state used for follower catch-up | Bound in-memory log growth | Compaction stops at `last_applied`; snapshot isolation is still open (C7). |
 | Storage WAL + checkpoint | Committed key/value state and per-shard applied index | Recover the local state machine after a crash | This does not make the Raft log durable. |
 
 The WAL uses length-prefixed, checksummed frames. Recovery ignores and truncates only a
@@ -150,15 +151,18 @@ The server uses one thread per HTTP request plus background election, heartbeat,
 transaction-cleanup threads. The key shared locks are:
 
 - One lock per shard for Raft state.
+- One apply lock per shard, which serializes applying committed entries.
 - One global store lock for state-machine data.
 - One condition per shard for the batch queue.
 - Internal locks inside the metrics registry and storage engine.
 
 Disk and network I/O are kept outside shard locks where possible. The committed-state
-persistence path uses the order `store_lock -> storage engine lock`. Code that needs a
-snapshot copies store state without retaining a shard lock, then revalidates the shard
-boundary before truncating. These rules limit lock hold time and avoid a shard/store lock
-cycle.
+persistence path uses the order `store_lock -> storage engine lock`. Applying committed
+entries takes `apply_lock -> shard.lock` (briefly, never across I/O) and
+`apply_lock -> store_lock -> storage engine lock`; nothing acquires a shard's apply lock
+while holding its shard lock or the store lock. Snapshot creation holds the apply lock, so
+its store copy is exactly the applied prefix, then revalidates the shard boundary before
+truncating. These rules limit lock hold time and avoid a shard/store lock cycle.
 
 ## Scaling model and measured bottlenecks
 
@@ -225,8 +229,8 @@ The order is safety before speed:
 2. **Standard `nextIndex`/`matchIndex` replication (C4) and commit rule (C5).** Stop shipping
    whole logs, repair divergent suffixes and commit only entries proven safe by the
    current-term rule.
-3. **Ordered apply and shard-scoped snapshots (C7-C8).** Make the state-machine boundary
-   precise before expanding the read guarantee.
+3. **Shard-scoped snapshots (C7).** Ordered apply landed with C8/C11; each shard's
+   snapshot must still stop carrying the shared store before the read guarantee expands.
 4. **Complete ReadIndex semantics.** Add an apply barrier and history-based linearizability
    testing after the underlying Raft invariants hold.
 5. **Durable request deduplication and transaction recovery.** Define retry semantics and

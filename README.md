@@ -13,7 +13,7 @@ through a write-ahead log, quorum-validated reads, and Prometheus metrics.
 Where behavior depends on process failure, the tests use real processes: they `SIGSTOP` a live
 leader to isolate it, `SIGKILL` the whole cluster twice and check what comes back, and corrupt
 bytes on disk to confirm recovery refuses to guess. Where deterministic RPC inputs say more than
-scheduler-dependent elections, they drive one real node with scripted peers. 128 checks in seven
+scheduler-dependent elections, they drive one real node with scripted peers. 141 checks in eight
 suites run in CI on Python 3.12 and 3.14.
 
 ## Quick start
@@ -122,7 +122,7 @@ the reasoning behind each decision are in [`docs/ARCHITECTURE.md`](docs/ARCHITEC
 
 ## Verification
 
-CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 128 checks each), standard library
+CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 141 checks each), standard library
 only.
 
 | Suite | Checks | What it exercises |
@@ -131,10 +131,11 @@ only.
 | [`test_raft_correctness.py`](test_raft_correctness.py) | 24 | One real node with a pinned election timeout, driven by hand-built RPCs: term/vote survive `SIGKILL`, election restriction, snapshot-boundary comparison, fail-closed topology check |
 | [`test_wal.py`](test_wal.py) | 17 | Replay, torn tails, CRC and checkpoint corruption, rotation, idempotent replay, and a three-node cluster `SIGKILL`ed twice |
 | [`test_http_contract.py`](test_http_contract.py) | 13 | Single-node election, 400s for malformed bodies and keys, keys containing `=`, `&` and spaces |
+| [`test_apply_order.py`](test_apply_order.py) | 13 | Every committed entry is applied once and in order: a leader applying the entry a timed-out round left behind (live, through a full-cluster `SIGKILL` restart and on the `/txn_commit` path), compaction bounded by `last_applied`, follower catch-up from its own log or a snapshot |
 | [`test_metrics.py`](test_metrics.py) | 9 | Metric primitives, thread safety, instrumentation hooks, a live scrape |
 | [`test_txn_routing.py`](test_txn_routing.py) | 5 | Prepare follows leader hints and unreachable-node fallback under one transaction ID; phase two targets the participant that prepared |
 | [`test_read_quorum.py`](test_read_quorum.py) | 4 | Barrier logic plus a live regression: pause the leader, elect a replacement, commit a newer value, isolate the majority, wake the old leader, assert 503 instead of the stale value |
-| **Total** | **128** | |
+| **Total** | **141** | |
 
 ```bash
 python3 test_metrics.py
@@ -144,9 +145,10 @@ python3 test_txn_routing.py
 python3 test_read_quorum.py
 python3 test_http_contract.py
 python3 test_wal.py
+python3 test_apply_order.py
 ```
 
-Six suites start and stop their own node processes and clean up their own files;
+Seven suites start and stop their own node processes and clean up their own files;
 `test_txn_routing.py` needs none. By mechanism:
 
 - `test_raft_sharded.py` runs a real three-node cluster and restarts nodes with `pkill`
@@ -156,13 +158,17 @@ Six suites start and stop their own node processes and clean up their own files;
 - `test_raft_correctness.py` starts one real node with a pinned election timeout, drives it over
   HTTP with hand-built RPCs from scripted peers, and `SIGKILL`s it to test what survives.
 - `test_wal.py` `SIGKILL`s a three-node cluster twice and corrupts bytes on disk.
+- `test_apply_order.py` pauses both followers with `SIGSTOP` so a write times out and stays
+  in the leader's log, then checks that every node applies it once a later write commits it,
+  including after a full-cluster `SIGKILL` and through a snapshot install. Its in-process
+  cases drive the apply, compaction and snapshot-install paths directly.
 - `test_txn_routing.py` and `test_metrics.py` stub `send_rpc` in-process (unreachable peers,
   `not_leader` hints); `test_http_contract.py` drives a single real node over HTTP.
 
 Every correctness defect found so far is logged in
 [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the
-failure scenario, the fix and the regression that keeps it fixed: ten cases, two closed, one
-partly closed, seven open and listed below.
+failure scenario, the fix and the regression that keeps it fixed: eleven cases, four closed
+(C1, C2, C8, C11), one partly closed, six open and listed below.
 
 ## Scope boundaries
 
@@ -171,7 +177,7 @@ This is a subset of Raft, and the missing pieces are tracked by case number:
 - Raft log durability across restarts; only term/vote and committed state are persisted (C3).
 - Per-follower `nextIndex`/`matchIndex`, suffix repair and the current-term commit rule; the
   leader ships its whole retained log window and followers overwrite theirs (C4, C5).
-- Ordered apply and shard-scoped snapshots; each shard's snapshot carries the shared store (C7, C8).
+- Shard-scoped snapshots; each shard's snapshot carries the shared store (C7).
 - A full ReadIndex barrier; reads are quorum-validated leader reads (C9).
 - PreVote; an isolated node keeps raising its term and can force a healthy leader to step down
   when it rejoins (C10).
@@ -227,13 +233,13 @@ python3 benchmark_raft_sharded.py --quick --outdir /tmp/kv-bench   # the default
 
 | Path | Responsibility |
 |---|---|
-| [`node_raft_sharded.py`](node_raft_sharded.py) | Elections, replication, routing, reads, snapshots, batching, HTTP API, 2PC (about 1,800 lines) |
+| [`node_raft_sharded.py`](node_raft_sharded.py) | Elections, replication, routing, reads, snapshots, batching, HTTP API, 2PC (about 1,850 lines) |
 | [`storage.py`](storage.py) | JSON backend, framed WAL, atomic checkpoints |
 | [`metrics.py`](metrics.py) | Thread-safe Prometheus primitives and text rendering |
 | [`raft_harness.py`](raft_harness.py) | Real-node and scripted-peer harness for the correctness suite |
 | [`start.sh`](start.sh) | Three-node local launcher |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Request flows, lock ordering, failure semantics, decision record |
-| [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) | The ten correctness cases, closed and open |
+| [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) | The eleven correctness cases, closed and open |
 | [`docs/LESSON_01_READ_QUORUM.md`](docs/LESSON_01_READ_QUORUM.md), [`docs/LESSON_02_TXN_LEADER_CHANGES.md`](docs/LESSON_02_TXN_LEADER_CHANGES.md) | Two failures worked from symptom to invariant to test |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | Metric contract |
 | [`docs/EVOLUTION.md`](docs/EVOLUTION.md) | How the earlier prototypes in Git history led here |
@@ -241,7 +247,7 @@ python3 benchmark_raft_sharded.py --quick --outdir /tmp/kv-bench   # the default
 ## Roadmap
 
 Safety before speed: durable Raft log (C3); `nextIndex`/`matchIndex` replication and the commit
-rule (C4, C5); ordered apply and shard-scoped snapshots (C7, C8); a full ReadIndex barrier with
+rule (C4, C5); shard-scoped snapshots (C7); a full ReadIndex barrier with
 history-based tests (C9); PreVote (C10); request deduplication and recoverable transaction
 decisions; then persistent connections and multi-host benchmarks. Every change starts by
 reproducing a failure, names the property at risk, lands with a regression, and states what it

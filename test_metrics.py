@@ -228,6 +228,8 @@ class NodeMetricsLogicTest(unittest.TestCase):
                 ]
                 shard.log_offset = 0
                 shard.commit_index = self.node.SNAPSHOT_THRESHOLD
+                # Compaction covers only applied entries (C11), so mark them applied.
+                shard.last_applied = self.node.SNAPSHOT_THRESHOLD
 
             self.node.maybe_snapshot(shard)
 
