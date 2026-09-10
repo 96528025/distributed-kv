@@ -80,6 +80,11 @@ jobs:
       - name: Run apply-order suite (13 tests)
         run: python3 test_apply_order.py
 
+      # In-process timer checks: election and transaction-lock timers ignore
+      # wall-clock steps. No node processes.
+      - name: Run timer suite (5 tests)
+        run: python3 test_timers.py
+
       - name: Clean up stray node processes and test artifacts
         if: always()
         run: |
