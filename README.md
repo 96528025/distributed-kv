@@ -1,24 +1,29 @@
-# Sharded Raft KV Store
+# Distributed KV — Replication, Recovery, and Failure Testing
 
 [![CI](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml)
-[![Python 3.12 and 3.14](https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?logo=python&logoColor=white)](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml)
-[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?logo=python&logoColor=white)](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A replicated key-value store written from scratch in standard-library Python. Three node
-processes talk over HTTP/JSON, keys are hashed across three independent Raft-style groups, and a
-write is acknowledged only after a majority of nodes has it. The project exists to make the hard
-parts of a distributed store visible and testable: leader election, replication, crash recovery
-through a write-ahead log, quorum-validated reads, and Prometheus metrics.
+**A three-process key-value store built in standard-library Python to explore replication, leader failure, and crash recovery.** Clients can contact any node; the node routes each key to its shard leader, which replicates writes to a majority before reporting success. An optional write-ahead log restores committed data after process crashes.
 
-Where behavior depends on process failure, the tests use real processes: they `SIGSTOP` a live
-leader to isolate it, `SIGKILL` the whole cluster twice and check what comes back, and corrupt
-bytes on disk to confirm recovery refuses to guess. Where deterministic RPC inputs say more than
-scheduler-dependent elections, they drive one real node with scripted peers. 146 checks in nine
-suites run in CI on Python 3.12 and 3.14.
+The project demonstrates **distributed-systems implementation, storage engineering, failure injection, and observability**. It implements a documented subset of Raft, with remaining safety gaps tracked explicitly. The three shards distribute leadership and replication work; every node still stores every key.
 
-## Quick start
+## Engineering highlights
 
-Requirements: Python 3.12 or newer, `bash` and `curl`, on macOS or Linux. Nothing to install.
+| Capability | What the code does | Where to inspect it |
+| --- | --- | --- |
+| Replicated writes | Per-shard leader routing, concurrent peer RPCs, majority acknowledgements, batches of up to 20 queued operations | [`node_raft_sharded.py`](node_raft_sharded.py): `batch_loop`, `_handle_set`, `_handle_delete` |
+| Election recovery | Persists each shard's term and vote before dependent replies; refuses stale-log candidates and invalid persisted topology | `persist_hard_state`, `_handle_vote`; [`test_raft_correctness.py`](test_raft_correctness.py) |
+| Stale-leader rejection | Requires same-term quorum confirmation before a leader serves `/get`; an isolated old leader returns `503` | `confirm_read_quorum`; [`test_read_quorum.py`](test_read_quorum.py) |
+| Storage recovery | CRC32-framed committed-operation WAL, SHA-256-verified checkpoints, torn-tail recovery, idempotent replay | [`storage.py`](storage.py), [`test_wal.py`](test_wal.py) |
+| Ordered application | Applies every entry covered by a commit, including earlier entries whose client requests timed out | `apply_committed`; [`test_apply_order.py`](test_apply_order.py) |
+| Operational visibility | Dependency-free Prometheus counters, gauges, and histograms with bounded labels | [`metrics.py`](metrics.py), [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
+
+CI runs **146 checks across nine suites on both Python 3.12 and 3.14**, including real node processes, leader suspension, full-cluster process kills, and disk corruption. These are scenario-specific regressions; they do not establish complete Raft safety or production readiness.
+
+## Run in five minutes
+
+Prerequisites: Python 3.12+, Bash, and curl on macOS or Linux. There are no third-party runtime or test dependencies. Run commands from the repository root.
 
 ```bash
 ./start.sh start
@@ -34,109 +39,72 @@ curl http://127.0.0.1:5001/metrics
 ./start.sh stop
 ```
 
-The launcher starts nodes on ports `5001-5003` with the WAL backend and keeps runtime files in the
-git-ignored `.run/` and `.demo-data/` directories. Any node accepts any request; a write sent to a
-follower is forwarded to the shard leader and the reply carries `forwarded_by`. `KV_FSYNC=1` adds
-an `fsync` after every committed batch.
+The launcher starts ports `5001–5003`, waits for leaders, selects the WAL backend, and stores logs/PIDs in `.run/` and data in `.demo-data/`. To request an `fsync` after each committed batch, start with `KV_FSYNC=1 ./start.sh start`.
 
-To run one process by hand:
+For manual process control, each node needs its own command; this starts only the first node:
 
 ```bash
 python3 node_raft_sharded.py 5001 5002 5003 --backend=wal --data-dir=.demo-data
 ```
 
-Nodes bind to `127.0.0.1`. The client API and the replication RPCs share one unauthenticated,
-unencrypted HTTP port, so `--host=0.0.0.0` belongs on a trusted network only.
+Nodes bind to `127.0.0.1` by default. Client requests and replication RPCs share one HTTP port without authentication or TLS.
 
-### API
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/set` | Set one string key/value through the owning shard leader |
-| `GET` | `/get?key=...` | Read through the leader's quorum barrier |
-| `POST` | `/delete` | Delete one key; deleting an absent key succeeds |
-| `POST` | `/txn` | Multi-key write through a deliberately non-durable two-phase commit |
-| `GET` | `/health` | Per-shard role, term, leader and log-window state |
-| `GET` | `/metrics` | Prometheus text exposition |
-
-`GET /all` dumps a node's local store without a quorum check, for inspection. `/debug/raft`
-exposes the full Raft state and is served only when `RAFT_TEST_MODE=1`.
-
-## What is implemented
-
-| Area | Implementation | Evidence |
-|---|---|---|
-| Sharding | `MD5(key) % 3` picks a shard; each shard is an independent Raft-style group with its own term, leader and log. Every process hosts every shard and holds the full key space | `/health` shows three leaders, often on three different nodes |
-| Elections | Randomized timeouts (1.5-3.0 s) on the monotonic clock; `currentTerm` and `votedFor` are `fsync`ed and atomically renamed before any vote-dependent reply; candidates with stale logs are refused | Crash/restart, double-vote and log-freshness regressions |
-| Writes | Forwarded to the shard leader, replicated to peers in parallel, committed once a majority acknowledges. A per-shard worker drains up to 20 queued writes into one replication round | Three-process integration suite, concurrent set/delete checks |
-| Reads | Followers forward to the leader; the leader probes its peers in the current term and answers 503 unless a majority still recognizes it | Live `SIGSTOP` isolated-old-leader regression |
-| Compaction | Logs over 20 entries are compacted into a snapshot; a follower behind the retained window installs the leader's snapshot | Snapshot and follower-restart checks |
-| Persistence | Optional write-ahead log with CRC32-framed records and SHA-256-verified checkpoints; the legacy JSON backend rewrites the whole store per commit and stays as a baseline | Replay, torn-tail, corruption, rotation and two full-cluster `SIGKILL` cycles |
-| Observability | Counters, gauges and histograms in Prometheus text format from a 230-line dependency-free module | Primitive, instrumentation and live-scrape tests |
-
-## How it works
+## Architecture and request flow
 
 ```mermaid
 flowchart LR
-    C[Client] -->|HTTP/JSON| N[Any node]
-    N --> H{MD5 key mod 3}
-    H -->|0| S0[Shard 0 leader]
-    H -->|1| S1[Shard 1 leader]
-    H -->|2| S2[Shard 2 leader]
-    S0 -.-> Q
-    S1 -.-> Q
-    S2 -.-> Q
-    Q[Selected shard: AppendEntries to peers, wait for majority] --> A[Apply to shared in-memory store]
-    A --> P[WAL append, periodic checkpoint]
+    C[Client] --> N[Any node: HTTP / JSON]
+    N --> H[MD5 key modulo 3]
+    H --> L[Leader of the selected shard]
+    L --> B[Queue: up to 20 operations per batch]
+    B --> R[AppendEntries to peer processes]
+    R --> Q{Majority acknowledged?}
+    Q -->|Yes| A[Apply committed entries in order]
+    A --> S[Persist committed state]
+    S --> OK[Reply to clients]
+    Q -->|Timeout| U[Return error: outcome unknown]
 ```
 
-**Write path.** The receiving node hashes the key and forwards to the shard leader if needed. A
-per-shard worker takes up to 20 queued operations, appends them to the in-memory log, and sends
-`AppendEntries` to both peers concurrently. Once a majority acknowledges, the entries are applied
-to the store and handed to the storage engine before the clients are answered. A majority wait
-longer than one second returns an error whose outcome is unknown: the entry stays in the leader's
-log and may still commit.
+Each process hosts all three shard groups. Each group has its own term, vote, leader, log window, commit index, and application position; the process uses a shared key-value store. This is fixed modulo sharding, with no dynamic membership, rebalancing, or consistent-hash ring.
 
-**Read path.** A follower forwards `/get` to the leader it last heard from. Before reading local
-state, the leader sends a current-term probe to its peers and requires a majority of same-term
-acknowledgements; a peer reporting a higher term makes it step down and persist that term first.
-This closes the demonstrated isolated-old-leader path. It is not a full ReadIndex barrier, because
-there is no separate applied-index wait; that gap is case C9 in
-[`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md).
+**Write.** A follower forwards the request to its known shard leader. The leader appends queued operations, sends its retained log window to peers concurrently, waits up to one second for a majority, and applies/persists committed entries before replying. A timeout leaves the entries in the log: a later successful replication round may commit them. There is no client request-ID deduplication, so a timeout is not proof that a write was aborted.
 
-**Persistence.** Three kinds of state are kept apart on purpose:
+**Read.** A follower forwards `/get`. The leader probes peers with current-term `AppendEntries`, checks that a majority still recognizes its term, and steps down if a higher term is observed. This prevents the tested isolated-old-leader stale read. It is a quorum-validated leader read, with full ReadIndex/application-barrier semantics still open.
 
-- *Raft hard state* (`currentTerm`, `votedFor` per shard): `fsync`ed and atomically renamed
-  before any dependent reply. A corrupt file or a shard-count mismatch refuses startup rather than
-  resetting to term 0.
-- *Raft snapshots*: the compaction boundary, used for follower catch-up.
-- *State-machine WAL*: committed operations only, as `MAGIC | length | versioned JSON | CRC32`
-  frames. A checkpoint is written to a temp file, `fsync`ed, atomically renamed, and only then is
-  the WAL truncated (every 1,000 records or 8 MiB). Recovery trims a torn final frame; a bad
-  magic, impossible length, wrong CRC or wrong checkpoint digest fails closed. Replay is idempotent
-  through per-shard applied indexes.
+**Compaction.** A shard whose log exceeds 20 entries may compact its applied prefix. A follower behind the retained window can install a snapshot. Snapshots currently contain the shared store, so shard isolation during snapshot installation remains a tracked correctness gap.
 
-WAL appends are flushed to the OS per commit, which survives a process crash; `KV_FSYNC=1` adds a
-disk sync. Hard state and checkpoints are always `fsync`ed. Lock ordering, failure semantics and
-the reasoning behind each decision are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+**Transactions.** `/txn` groups operations by shard and performs prepare followed by commit or abort. Prepare follows leader hints and stages key locks/intents in memory with a 10-second monotonic lease. Phase two targets the participants that actually prepared. The coordinator does not validate every phase-two result; `status: "ok"` means the coordinator reported success, not that a durable atomic transaction was established. This path is an experimental, non-durable 2PC implementation.
 
-## Verification
+## Persistence: three different kinds of state
 
-CI runs every suite on Python 3.12 and 3.14 (two matrix jobs, 146 checks each), standard library
-only.
+| State | Purpose | Durability behavior |
+| --- | --- | --- |
+| Raft hard state | Remembers `currentTerm` and `votedFor` per shard | Temporary file, `fsync`, atomic rename; persisted before dependent replies; corrupt state refuses startup |
+| Raft snapshot | Compacted state for follower catch-up | Stores the compaction boundary; current shared-store snapshot scope is tracked as C7 |
+| State-machine WAL | Restores committed key-value operations | Frames contain magic, length, versioned JSON, and CRC32; optional per-commit `fsync` |
 
-| Suite | Checks | What it exercises |
-|---|---:|---|
-| [`test_raft_sharded.py`](test_raft_sharded.py) | 56 | Real three-node cluster: elections, forwarding, compaction, follower restart, transactions, quorum reads, batched writes and deletes |
-| [`test_raft_correctness.py`](test_raft_correctness.py) | 24 | One real node with a pinned election timeout, driven by hand-built RPCs: term/vote survive `SIGKILL`, election restriction, snapshot-boundary comparison, fail-closed topology check |
-| [`test_wal.py`](test_wal.py) | 17 | Replay, torn tails, CRC and checkpoint corruption, rotation, idempotent replay, and a three-node cluster `SIGKILL`ed twice |
-| [`test_http_contract.py`](test_http_contract.py) | 13 | Single-node election, 400s for malformed bodies and keys, keys containing `=`, `&` and spaces |
-| [`test_apply_order.py`](test_apply_order.py) | 13 | Every committed entry is applied once and in order: a leader applying the entry a timed-out round left behind (live, through a full-cluster `SIGKILL` restart and on the `/txn_commit` path), compaction bounded by `last_applied`, follower catch-up from its own log or a snapshot |
-| [`test_metrics.py`](test_metrics.py) | 9 | Metric primitives, thread safety, instrumentation hooks, a live scrape |
-| [`test_txn_routing.py`](test_txn_routing.py) | 5 | Prepare follows leader hints and unreachable-node fallback under one transaction ID; phase two targets the participant that prepared |
-| [`test_timers.py`](test_timers.py) | 5 | Election and transaction-lock timers follow the monotonic clock: a wall-clock step neither starts, postpones nor expires anything |
-| [`test_read_quorum.py`](test_read_quorum.py) | 4 | Barrier logic plus a live regression: pause the leader, elect a replacement, commit a newer value, isolate the majority, wake the old leader, assert 503 instead of the stale value |
-| **Total** | **146** | |
+The WAL is **not a durable Raft replication log**: uncommitted Raft entries are not persisted. Checkpoints record the store and per-shard applied indexes, use a SHA-256 digest, and publish via `fsync` plus atomic rename before truncating the WAL. Rotation occurs at 1,000 records or 8 MiB. Replay skips already-applied indexes, trims an incomplete final frame, and rejects detected corruption rather than guessing.
+
+Default WAL appends flush to the OS; `KV_FSYNC=1` requests stronger disk durability. Process-kill tests exercise process-crash recovery, not physical power-loss recovery. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for locking and persistence ordering.
+
+## HTTP API
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| `POST` | `/set` | Set a string key/value through the shard leader |
+| `GET` | `/get?key=...` | Quorum-validated leader read |
+| `POST` | `/delete` | Delete a key; absent keys also succeed |
+| `POST` | `/txn` | Experimental multi-key 2PC; see transaction limitations above |
+| `GET` | `/health` | Per-shard role, leader, term, and log-window state |
+| `GET` | `/metrics` | Prometheus text exposition |
+| `GET` | `/all` | Local inspection dump without a quorum check |
+| `GET` | `/debug/raft` | Detailed state, available only with `RAFT_TEST_MODE=1` |
+
+Metrics cover HTTP counts/latency, elections, leader transitions, read-quorum outcomes, replication latency, snapshots, transaction outcomes, and per-shard state. Keys, values, and request IDs are excluded from labels. The transaction-success label is deliberately `reported_ok`.
+
+## Tests and evidence
+
+Run the same suites as [CI](.github/workflows/ci.yml):
 
 ```bash
 python3 test_metrics.py
@@ -150,111 +118,44 @@ python3 test_apply_order.py
 python3 test_timers.py
 ```
 
-Seven suites start and stop their own node processes and clean up their own files;
-`test_txn_routing.py` and `test_timers.py` need none. By mechanism:
+| Suite | Checks | Evidence |
+| --- | ---: | --- |
+| `test_raft_sharded.py` | 56 | Three-node integration: elections, forwarding, snapshots, follower restart, transactions, reads, batched writes/deletes |
+| `test_raft_correctness.py` | 24 | One real node with scripted peers: term/vote crash recovery, log freshness, snapshot boundary, topology rejection |
+| `test_wal.py` | 17 | WAL replay, corruption, torn tails, rotation, checkpoints; three-node cluster killed twice with `SIGKILL` |
+| `test_http_contract.py` | 13 | Single-node election, malformed client input, URL-encoded keys |
+| `test_apply_order.py` | 13 | Ordered/idempotent application, earlier timed-out entries, restart, compaction, snapshot catch-up |
+| `test_metrics.py` | 9 | Metric primitives, concurrency, hooks, live scrape |
+| `test_txn_routing.py` | 5 | Leader hints, fallback discovery, conflicts, repeated IDs, participant routing |
+| `test_timers.py` | 5 | Wall-clock changes do not change election or lock-lease timing |
+| `test_read_quorum.py` | 4 | Quorum decisions and real `SIGSTOP`/`SIGCONT` stale-leader regression |
 
-- `test_raft_sharded.py` runs a real three-node cluster and restarts nodes with `pkill`
-  (`SIGTERM`).
-- `test_read_quorum.py` pauses and resumes a live leader with `SIGSTOP`/`SIGCONT` in its
-  regression case; its other cases stub `send_rpc` with current-term and higher-term replies.
-- `test_raft_correctness.py` starts one real node with a pinned election timeout, drives it over
-  HTTP with hand-built RPCs from scripted peers, and `SIGKILL`s it to test what survives.
-- `test_wal.py` `SIGKILL`s a three-node cluster twice and corrupts bytes on disk.
-- `test_apply_order.py` pauses both followers with `SIGSTOP` so a write times out and stays
-  in the leader's log, then checks that every node applies it once a later write commits it,
-  including after a full-cluster `SIGKILL` and through a snapshot install. Its in-process
-  cases drive the apply, compaction and snapshot-install paths directly.
-- `test_txn_routing.py` and `test_metrics.py` stub `send_rpc` in-process (unreachable peers,
-  `not_leader` hints); `test_http_contract.py` drives a single real node over HTTP.
-- `test_timers.py` loads the node in-process and steps the wall clock with a mock.
+The process-based suites manage local node processes and fixed ports; run them in an isolated checkout without another demo cluster using those ports.
 
-Every correctness defect found so far is logged in
-[`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) with the Raft property at risk, the
-failure scenario, the fix and the regression that keeps it fixed: eleven cases, four closed
-(C1, C2, C8, C11), one partly closed, six open and listed below.
+## Measured performance and its limits
 
-## Scope boundaries
+- **Storage-only benchmark:** the committed July 23 run uses 1,000 writes per point and the median of three trials. JSON throughput falls from approximately 1,400 to 28 ops/s as the store grows from 100 to 50,000 entries; WAL p50 append latency remains approximately 0.008 ms. This excludes HTTP and replication and is not an end-to-end durability claim. A second Linux run records the same trend. [Method and results](benchmarks/storage_benchmark.md).
+- **Historical cluster benchmark:** on one laptop with the JSON backend, median throughput rises from 192 ops/s at concurrency 1 to 647 at concurrency 50, while p99 rises from 12 to 358 ms. The concurrent trials vary widely. This run predates quorum reads and has no batching-disabled control, so it does not measure current capacity or isolate a batching speedup. [Raw results and caveats](benchmarks/README.md).
+- **No demonstrated multi-host scaling:** the same historical run is slower with keys spread across three shards than with one shard. Leader placement, CPU use, and batch depth were not controlled well enough to assign a cause.
 
-This is a subset of Raft, and the missing pieces are tracked by case number:
-
-- Raft log durability across restarts; only term/vote and committed state are persisted (C3).
-- Per-follower `nextIndex`/`matchIndex`, suffix repair and the current-term commit rule; the
-  leader ships its whole retained log window and followers overwrite theirs (C4, C5).
-- Shard-scoped snapshots; each shard's snapshot carries the shared store (C7).
-- A full ReadIndex barrier; reads are quorum-validated leader reads (C9).
-- PreVote; an isolated node keeps raising its term and can force a healthy leader to step down
-  when it rejoins (C10).
-- Exactly-once writes; a timed-out write has an unknown outcome and there is no request
-  deduplication (C6).
-- Crash-safe transactions; `/txn` is a two-phase commit whose decisions and prepared intents live
-  in memory behind a 10-second lock lease. Its success metric is named `reported_ok`, not
-  `committed`.
-- Power-loss durability for WAL appends unless `KV_FSYNC=1` is set.
-- Dynamic membership, rebalancing, consistent hashing, authentication or TLS. Sharding spreads
-  leadership and replication work; every node still holds every key.
-
-## Observability
-
-`GET /metrics` exports 14 bounded-cardinality metrics covering HTTP counts and latency,
-elections and leader transitions, read-quorum outcomes, replication-round latency, snapshots,
-transaction outcomes, and per-shard term, role, commit index and log-window size. Keys, values and
-request IDs are never labels; unknown paths collapse to one `unknown` route. Names, labels and
-starter queries are in [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
-
-## Benchmarks
-
-[`benchmark_storage.py`](benchmark_storage.py) times the storage engines alone, with no HTTP or
-Raft in the path. In the committed run (`benchmarks/storage_results_2026-07-23.csv`, 1,000 writes
-per point, median of 3) the JSON backend falls from 1,400 to 28 ops/s as the store grows from 100
-to 50,000 entries, because every commit rewrites the whole file, while WAL p50 append latency
-stays at 0.008 ms across the same range. A second run on Linux (`storage_results_2026-08-20.csv`)
-shows the same shape. Details in [`benchmarks/storage_benchmark.md`](benchmarks/storage_benchmark.md).
-
-[`benchmark_raft_sharded.py`](benchmark_raft_sharded.py) measures client-observed throughput and
-p50/p95/p99 latency against a three-node cluster. The committed run (`benchmarks/results.json`,
-2026-07-23) used the JSON backend on one laptop and predates the read-quorum barrier, so it
-supports two narrow observations and no capacity claim:
-
-- Concurrency raised throughput: 192 ops/s at concurrency 1 versus 647 ops/s at concurrency 50
-  in the median run, with p99 rising from 12 ms to 358 ms. The five concurrent trials spanned
-  250-1,480 ops/s. The run has no arm with batching disabled, so the gain is consistent with the
-  leader draining up to 20 queued writes per round, not a measurement of batching alone.
-- Spreading keys over three shards did not help on one host: 373 ops/s against 725 ops/s with
-  every key on one shard. A likely cause is that three server processes shared one CPU and
-  spreading traffic shrank each shard's batches. Leader placement was not controlled: the run
-  kept only the number of distinct leader hosts per trial (`leader_spread_each`), not which shard
-  led where, and CPU use and actual batch depth were not recorded. Multi-host scaling is untested. See [`benchmarks/README.md`](benchmarks/README.md).
-
-Smoke runs:
+Optional local benchmark smoke runs:
 
 ```bash
 python3 benchmark_storage.py --quick --no-save
-python3 benchmark_raft_sharded.py --quick --outdir /tmp/kv-bench   # the default outdir overwrites benchmarks/results.*
+python3 benchmark_raft_sharded.py --quick --outdir /tmp/kv-bench
 ```
 
-## Repository map
+## Current scope and next work
 
-| Path | Responsibility |
-|---|---|
-| [`node_raft_sharded.py`](node_raft_sharded.py) | Elections, replication, routing, reads, snapshots, batching, HTTP API, 2PC (about 1,850 lines) |
-| [`storage.py`](storage.py) | JSON backend, framed WAL, atomic checkpoints |
-| [`metrics.py`](metrics.py) | Thread-safe Prometheus primitives and text rendering |
-| [`raft_harness.py`](raft_harness.py) | Real-node and scripted-peer harness for the correctness suite |
-| [`start.sh`](start.sh) | Three-node local launcher |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Request flows, lock ordering, failure semantics, decision record |
-| [`docs/RAFT_CORRECTNESS.md`](docs/RAFT_CORRECTNESS.md) | The eleven correctness cases, closed and open |
-| [`docs/LESSON_01_READ_QUORUM.md`](docs/LESSON_01_READ_QUORUM.md), [`docs/LESSON_02_TXN_LEADER_CHANGES.md`](docs/LESSON_02_TXN_LEADER_CHANGES.md) | Two failures worked from symptom to invariant to test |
-| [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | Metric contract |
-| [`docs/EVOLUTION.md`](docs/EVOLUTION.md) | How the earlier prototypes in Git history led here |
+The [correctness log](docs/RAFT_CORRECTNESS.md) records eleven cases: four closed, one partially addressed, and six open. Outstanding work includes durable Raft logs (C3), per-follower suffix repair (C4), the current-term commit rule (C5), request deduplication/timeout semantics (C6), shard-scoped snapshots (C7), full ReadIndex (C9), and PreVote (C10). Crash-safe transaction decisions are also absent.
 
-## Roadmap
+This is a local systems project with no frontend, hosted service, authentication, or TLS. Its strongest evidence is the implementation and regression trail, rather than a claim of production-grade consensus.
 
-Safety before speed: durable Raft log (C3); `nextIndex`/`matchIndex` replication and the commit
-rule (C4, C5); shard-scoped snapshots (C7); a full ReadIndex barrier with
-history-based tests (C9); PreVote (C10); request deduplication and recoverable transaction
-decisions; then persistent connections and multi-host benchmarks. Every change starts by
-reproducing a failure, names the property at risk, lands with a regression, and states what it
-still does not prove.
+## Code and documentation guide
+
+Start with [`node_raft_sharded.py`](node_raft_sharded.py), then [`storage.py`](storage.py) and [`raft_harness.py`](raft_harness.py). For a guided failure investigation, read [the stale-leader lesson](docs/LESSON_01_READ_QUORUM.md) or [the transaction-routing lesson](docs/LESSON_02_TXN_LEADER_CHANGES.md).
+
+[Architecture](docs/ARCHITECTURE.md) · [Correctness log](docs/RAFT_CORRECTNESS.md) · [Observability](docs/OBSERVABILITY.md) · [Project evolution](docs/EVOLUTION.md)
 
 ## License
 
