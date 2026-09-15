@@ -16,6 +16,7 @@ import socketserver
 import json
 import sys
 import urllib.request
+import urllib.error
 import urllib.parse
 import threading
 import hashlib
@@ -216,12 +217,31 @@ def send_rpc(port, path, data, timeout=0.5):
     except Exception:
         return None
 
-def send_get_rpc(port, path, timeout=0.5):
-    """Send an HTTP GET RPC, returning ``None`` on failure."""
+def forward_to_leader(port, path, data=None, timeout=0.5):
+    """Relay a client request to a shard leader and return ``(status, body)``.
+
+    Unlike ``send_rpc``, an HTTP error status from the leader is an answer, not
+    a failure: a 404 for a missing key must reach the client as a 404, not as
+    ``leader unreachable``. ``None`` means the leader could not be reached or
+    did not answer with a JSON object.
+    """
     try:
         url = f"http://{peer_host(port)}:{port}{path}"
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return json.loads(resp.read())
+        if data is None:
+            req = urllib.request.Request(url, method="GET")
+        else:
+            req = urllib.request.Request(url, data=json.dumps(data).encode(), method="POST")
+            req.add_header("Content-type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status, raw = resp.status, resp.read()
+        except urllib.error.HTTPError as err:
+            with err:
+                status, raw = err.code, err.read()
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            return None
+        return status, body
     except Exception:
         return None
 
@@ -1103,12 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
                     # Encode the key: forwarding it raw would corrupt any key
                     # containing "&", "=" or a space on the way to the leader.
                     forwarded = urllib.parse.urlencode({"key": key})
-                    result = send_get_rpc(leader, f"/get?{forwarded}")
-                    if result is not None:
-                        result["forwarded_by"] = MY_PORT
-                        self._respond(200 if "value" in result else 404, result)
-                    else:
-                        self._respond(503, {"error": "leader unreachable", "shard": sid})
+                    self._relay(forward_to_leader(leader, f"/get?{forwarded}"), sid)
                 else:
                     self._respond(503, {"error": "no leader yet for shard", "shard": sid})
                 return
@@ -1313,6 +1328,20 @@ class Handler(BaseHTTPRequestHandler):
             )
             return False, f"failed to reach majority ({len(acks)}/{majority()})"
 
+    def _relay(self, reply, sid):
+        """Answer with the leader's own status and body, marked ``forwarded_by``.
+
+        Only a transport failure is reported as 503 ``leader unreachable``; the
+        leader's 404, 500 and 503 answers pass through unchanged so a client
+        gets the same reply whichever node it asked.
+        """
+        if reply is None:
+            self._respond(503, {"error": "leader unreachable", "shard": sid})
+            return
+        status, body = reply
+        body["forwarded_by"] = MY_PORT
+        self._respond(status, body)
+
     def _require_key(self, body):
         """Return a valid string key, or respond 400 and return ``None``.
 
@@ -1343,12 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
         if r != LEADER:
             if l is not None:
                 print(f"\n↪️  leader for shard {sid} is {l}; forwarding...")
-                result = send_rpc(l, "/set", {"key": key, "value": value})
-                if result:
-                    result["forwarded_by"] = MY_PORT
-                    self._respond(200, result)
-                else:
-                    self._respond(503, {"error": "leader unreachable", "shard": sid})
+                self._relay(forward_to_leader(l, "/set", {"key": key, "value": value}), sid)
             else:
                 self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
             return
@@ -1391,12 +1415,7 @@ class Handler(BaseHTTPRequestHandler):
         if r != LEADER:
             if l is not None:
                 print(f"\n↪️  leader for shard {sid} is {l}; forwarding the delete...")
-                result = send_rpc(l, "/delete", {"key": key})
-                if result:
-                    result["forwarded_by"] = MY_PORT
-                    self._respond(200, result)
-                else:
-                    self._respond(503, {"error": "leader unreachable", "shard": sid})
+                self._relay(forward_to_leader(l, "/delete", {"key": key}), sid)
             else:
                 self._respond(503, {"error": "no leader yet for this shard", "shard": sid})
             return
