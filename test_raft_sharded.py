@@ -17,8 +17,8 @@ Coverage (section numbers match the run output):
   9. Quorum-validated Leader reads (/get routed to the leader)
  10. Batch writes (10 concurrent sets + 5 concurrent deletes merged into one Raft round)
 
-This is an integration script rather than a unittest/pytest suite: the 11 sections above produce
-56 assertions (checks) at run time, and a full pass prints 56/56.
+This integration script prints a runtime summary for the sections above and exits
+unsuccessfully if any check fails.
 """
 
 import json
@@ -31,11 +31,16 @@ import os
 import glob
 import threading
 import atexit
+import tempfile
+import socket
 
 # ── configuration ─────────────────────────────────────────
 PORTS   = [5001, 5002, 5003]
 BASE    = os.path.dirname(os.path.abspath(__file__))
 SCRIPT  = os.path.join(BASE, "node_raft_sharded.py")
+_STATE = tempfile.TemporaryDirectory(prefix="kv-integration-")
+STATE_DIR = _STATE.name
+_owned = {}
 
 PASS = "\033[92m✅ PASS\033[0m"
 FAIL = "\033[91m❌ FAIL\033[0m"
@@ -113,37 +118,43 @@ def wait_for_cluster(timeout=12):
 
 def start_node(port, peers):
     peer_args = [str(p) for p in peers if p != port]
+    # Refuse occupied ports; never attach to or terminate an unrelated node.
+    with socket.socket() as probe:
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            raise RuntimeError(f"port {port} is already in use")
     proc = subprocess.Popen(
-        [sys.executable, SCRIPT, str(port)] + peer_args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=BASE,
+        [sys.executable, SCRIPT, str(port), *peer_args, f"--data-dir={STATE_DIR}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=STATE_DIR,
     )
+    _owned[port] = proc
     return proc
 
 def stop_node(port):
-    subprocess.run(["pkill", "-f", f"node_raft_sharded.py {port}"],
-                   capture_output=True)
+    proc = _owned.pop(port, None)
+    if proc is not None:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
     time.sleep(0.5)
 
 def stop_all():
-    subprocess.run(["pkill", "-f", "node_raft_sharded.py"],
-                   capture_output=True)
-    time.sleep(1)
+    for port in list(_owned):
+        stop_node(port)
 
 def clean_files():
     for pattern in ("snapshot_*.json", "data_raft_sharded_*.json",
                     "raft_hardstate_*.json", "raft_hardstate_*.json.tmp"):
-        for f in glob.glob(os.path.join(BASE, pattern)):
+        for f in glob.glob(os.path.join(STATE_DIR, pattern)):
             os.remove(f)
 
-
 def _final_cleanup():
-    """Kill the node processes and clean up generated data/snapshot files on every exit path:
-    normal completion, test failure, an exception, or Ctrl-C. Without this hook the error paths
-    leave three node_raft_sharded.py processes holding ports 5001-5003."""
+    """Stop this run's processes and remove only its temporary state."""
     stop_all()
-    clean_files()
+    _STATE.cleanup()
 
 atexit.register(_final_cleanup)
 
@@ -250,7 +261,7 @@ for i in range(1, 61):
     http_post(PORTS[0], "/set", {"key": f"k{i}", "value": f"v{i}"})
 time.sleep(1)  # wait for the async snapshot to finish
 
-snap_files = glob.glob(os.path.join(BASE, "snapshot_*.json"))
+snap_files = glob.glob(os.path.join(STATE_DIR, "snapshot_*.json"))
 check("snapshot file created", len(snap_files) > 0,
       f"found {len(snap_files)} snapshot file(s): {[os.path.basename(f) for f in snap_files]}")
 
