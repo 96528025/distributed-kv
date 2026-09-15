@@ -87,9 +87,10 @@ Followers relay the leader's HTTP status and JSON object response, adding `forwa
 
 The WAL is **not a durable Raft replication log**: uncommitted Raft entries are not persisted. Checkpoints record the store and per-shard applied indexes, use a SHA-256 digest, and publish via `fsync` plus atomic rename before truncating the WAL. Rotation occurs at 1,000 records or 8 MiB. Replay skips already-applied indexes.
 
-The WAL persists local applied operations, not the Raft replication log. Recovery rejects checksum failures, invalid frame boundaries, implausible lengths, and a frame length that overruns the file when a later complete CRC-valid frame is present. Recovery leaves the WAL unchanged when it rejects corruption. An incomplete final frame may be truncated to the last valid boundary. The length field is not checksummed, so these rules do not detect every possible corruption pattern.
-
-Persisted Raft hard state includes the term and vote. Startup checks the stored shard count; it does not validate a complete membership identity.
+Recovery rejects the tested checksum and framing corruption without modifying the WAL;
+an incomplete final frame can be truncated. These checks do not detect every possible
+corruption pattern. Hard-state recovery also rejects a changed shard count. See
+[persistence boundaries](docs/ARCHITECTURE.md#persistence-boundaries) for the exact scope.
 
 Default WAL appends flush to the OS; `KV_FSYNC=1` requests stronger disk durability. Process-kill tests exercise process-crash recovery, not physical power-loss recovery. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for locking and persistence ordering.
 

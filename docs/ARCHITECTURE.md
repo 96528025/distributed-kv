@@ -83,7 +83,8 @@ instead of presenting one peak number.
 A timeout does not prove that a write was aborted. It means the outcome is unknown: a
 majority may have accepted the entry after the client stopped waiting. Safe automatic
 retries therefore require a durable request ID and deduplication table, which are not yet
-implemented. The current API must not be treated as exactly-once.
+implemented. The forwarding timeout is 0.5 seconds, shorter than the leader's one-second
+majority wait, so a forwarded request can time out while its leader is still working.
 
 ## Read path
 
@@ -128,12 +129,15 @@ and must not be conflated.
 | Raft snapshot | Compacted log boundary and state used for follower catch-up | Bound in-memory log growth | Compaction stops at `last_applied`; snapshot isolation is still open (C7). |
 | Storage WAL + checkpoint | Committed key/value state and per-shard applied index | Recover the local state machine after a crash | This does not make the Raft log durable. |
 
-The WAL uses length-prefixed, checksummed frames. Recovery ignores and truncates only a
-partial final frame; a bad checksum, impossible length or broken frame boundary fails
-closed, and so does a frame that overruns the file while complete records still follow
-it, since a torn frame can only be the last thing in the file. Checkpoint publication is ordered as `write temp -> fsync -> atomic replace ->
-fsync directory -> truncate WAL`, so a crash on either side of publication leaves at least
-one replayable source of truth.
+The WAL uses length-prefixed, checksummed frames. Recovery rejects bad checksums,
+invalid boundaries, implausible lengths, and overrunning frames followed by a complete
+CRC-valid frame. Rejection leaves the file unchanged; an incomplete final frame may be
+truncated to its last valid boundary. The length field is not checksummed, so this is
+not detection of every possible corruption pattern.
+
+Checkpoint publication follows `write temp -> fsync -> atomic replace -> fsync directory
+-> truncate WAL`, retaining a replayable source across the tested process-crash windows.
+Hard-state recovery checks the stored shard count, not a complete membership identity.
 
 ## Failure semantics
 
@@ -177,8 +181,8 @@ change when a lock's lease runs out.
 Independent shard leaders create the possibility of parallel writes, but the local
 benchmark deliberately reports that three shards did not outperform one shard on one
 laptop. Three server processes and the client compete for the same CPU, the Python GIL
-serializes work inside each process, leaders may concentrate on one machine, and spreading
-requests reduces batch depth.
+serializes work inside each process, and leaders may concentrate on one process. Spreading
+requests may reduce batch depth, but the preserved run did not measure it or isolate a cause.
 
 The current bottlenecks are therefore implementation boundaries, not evidence that Raft
 itself is the limiting factor:
@@ -249,11 +253,3 @@ The order is safety before speed:
 This roadmap is intentionally test-shaped: every change should begin with a reproducible
 failure, state the invariant it restores, and land with a regression that fails on the old
 implementation.
-
-## HTTP forwarding and recovery details
-
-Followers relay the leader's HTTP status and JSON object response, adding `forwarded_by`. A missing key returns `404` through either the leader or a follower. An unreachable leader or an unusable upstream response produces `503`. The forwarding timeout is 0.5 seconds, while the leader's majority wait can take up to one second; a forwarded request can therefore time out before the leader finishes. A timeout does not establish whether a write was committed.
-
-The WAL persists local applied operations, not the Raft replication log. Recovery rejects checksum failures, invalid frame boundaries, implausible lengths, and a frame length that overruns the file when a later complete CRC-valid frame is present. Recovery leaves the WAL unchanged when it rejects corruption. An incomplete final frame may be truncated to the last valid boundary. The length field is not checksummed, so these rules do not detect every possible corruption pattern.
-
-Persisted Raft hard state includes the term and vote. Startup checks the stored shard count; it does not validate a complete membership identity.

@@ -109,7 +109,7 @@ def new_election_timeout():
     return random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
 SNAPSHOT_THRESHOLD = 20   # Compact after more than 20 log entries.
 BATCH_MAX_SIZE     = 20   # Maximum operations merged into one batch.
-BATCH_TIMEOUT      = 0.005  # Maximum 5 ms batching window.
+BATCH_TIMEOUT      = 0.005  # Idle condition wait; queued work wakes the worker immediately.
 READ_QUORUM_TIMEOUT = 0.5   # Maximum wait for a leader-read quorum.
 
 
