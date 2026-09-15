@@ -7,7 +7,7 @@ Measurements
 ============
 1. Throughput for `/set`, `/get`, and `/txn` in operations per second.
 2. Per-operation p50, p95, p99, and maximum end-to-end latency.
-3. Batch-write effect: serial `/set` requests versus concurrent requests.
+3. Client concurrency: serial `/set` requests versus concurrent requests.
 4. Shard distribution: keys concentrated on one shard versus spread across
    all shards in the same three-node cluster.
 5. Throughput and p99 latency at concurrency levels 1, 10, 50, 100, and 200.
@@ -488,9 +488,9 @@ def test_batch(cl, total, concurrent_c, repeats):
     """
     Compare serial and concurrent writes from independently cleared data state.
     Serial requests normally occupy one Raft round each. Under concurrency,
-    `batch_loop` can merge up to 20 requests arriving within its 5 ms window.
+    `batch_loop` drains up to 20 requests already queued; 5 ms is its idle wait.
     """
-    print(f"\n=== Batch-write effect: serial c=1 vs concurrent c={concurrent_c} "
+    print(f"\n=== Client concurrency: serial c=1 vs concurrent c={concurrent_c} "
           f"({repeats} runs per arm) ===")
     serial, m_s = median_run(cl, "set_serial",
                              lambda: gen_kv("batch_serial_", total, cl.value_size),
@@ -624,7 +624,9 @@ def plot_pair(pair, labels, title, fname, outdir):
     for b, v in zip(bars, tput):
         ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.0f}",
                 ha="center", va="bottom")
-    fig.tight_layout()
+    fig.text(0.5, 0.025, "Single host; no batching-disabled control.",
+             ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     p = os.path.join(outdir, fname)
     fig.savefig(p, dpi=120)
     plt.close(fig)
@@ -746,11 +748,11 @@ def main():
             plot_latency_dist(per_op, args.outdir)
         if batch_pair:
             plot_pair(batch_pair, ["serial c=1", f"concurrent c={args.per_op_concurrency}"],
-                      f"batch write effect (~{batch_speedup:.1f}x)",
+                      "Write throughput by client concurrency",
                       "batch_effect.png", args.outdir)
         if shard_pair:
             plot_pair(shard_pair, ["1 shard (concentrated)", f"{num_shards} shards (spread)"],
-                      f"write throughput: concentrated vs spread ({shard_speedup:.2f}x)",
+                      "Single-machine throughput by shard distribution",
                       "shard_scalability.png", args.outdir)
     else:
         print("  WARNING: matplotlib is unavailable; PNG generation skipped")
@@ -764,7 +766,7 @@ def main():
     print("  1. HTTP/1.0 creates a new TCP connection and server thread per request.")
     print("  2. JSON encoding and the Python GIL add CPU and scheduling overhead.")
     print("  3. The legacy JSON backend rewrites the full store on each commit.")
-    print("  4. BATCH_TIMEOUT=5ms trades additional queueing latency for batching opportunities.")
+    print("  4. BATCH_TIMEOUT=5ms is an idle wait, not a fixed batch collection window.")
     print("The benchmark does not isolate these costs and should not be used to attribute")
     print("the observed limit to any single subsystem.")
     print("=" * 70)

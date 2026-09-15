@@ -48,8 +48,8 @@ request router -- hash(key) --> shard Raft group
   +---- forward to leader --------+
                                   |
                                   +--> replicate to a majority
-                                  +--> persist committed state
-                                  +--> apply to local state machine
+                                  +--> apply the committed prefix in order
+                                  +--> persist local applied state
                                   +--> respond
 ```
 
@@ -91,8 +91,8 @@ Reads route to the shard leader. Before returning its local value, the leader pr
 majority in its current term. If it cannot confirm a majority, it refuses the read. This
 prevents the demonstrated stale-old-leader failure in which a partitioned former leader
 continues serving old state. A follower relays the leader's status code and body
-unchanged, adding `forwarded_by`, so a missing key is a 404 through any node; 503
-`leader unreachable` is reserved for a transport failure.
+with `forwarded_by` added to JSON objects, so a missing key is a 404 through any node.
+An unreachable leader or an unusable upstream response produces 503.
 
 This barrier is narrower than the Raft ReadIndex protocol. It does not independently prove
 that the leader has applied every committed entry before reading. Complete linearizability
@@ -249,3 +249,11 @@ The order is safety before speed:
 This roadmap is intentionally test-shaped: every change should begin with a reproducible
 failure, state the invariant it restores, and land with a regression that fails on the old
 implementation.
+
+## HTTP forwarding and recovery details
+
+Followers relay the leader's HTTP status and JSON object response, adding `forwarded_by`. A missing key returns `404` through either the leader or a follower. An unreachable leader or an unusable upstream response produces `503`. The forwarding timeout is 0.5 seconds, while the leader's majority wait can take up to one second; a forwarded request can therefore time out before the leader finishes. A timeout does not establish whether a write was committed.
+
+The WAL persists local applied operations, not the Raft replication log. Recovery rejects checksum failures, invalid frame boundaries, implausible lengths, and a frame length that overruns the file when a later complete CRC-valid frame is present. Recovery leaves the WAL unchanged when it rejects corruption. An incomplete final frame may be truncated to the last valid boundary. The length field is not checksummed, so these rules do not detect every possible corruption pattern.
+
+Persisted Raft hard state includes the term and vote. Startup checks the stored shard count; it does not validate a complete membership identity.
