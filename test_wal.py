@@ -21,6 +21,8 @@ Requirements covered:
   13 repeated start/stop leaves data unchanged
   14 uncommitted in-memory data is not recovered, and the checkpoint applied index is
   15 a real 3-node cluster recovering across two SIGKILLs, with record index continuous afterwards
+  16 corrupted length field on an interior record (raises, WAL left untouched); a torn tail that
+     happens to contain the frame magic is still repaired as a tail
 
 Every test runs in a temporary directory and cleans up, leaving nothing in the repository.
 """
@@ -188,6 +190,78 @@ def t_checksum_corruption(d):
     except st.StorageCorruptionError:
         raised = True
     check("checksum corruption raises rather than failing silently", raised)
+
+
+# ── 16. corrupted length field on an interior record ────────
+def t_interior_length_corruption(d):
+    """A length field corrupted upward used to look like a torn tail.
+
+    Replay then dropped that record and every record behind it, and truncated the
+    WAL to match, so the loss was silent and permanent. A torn frame can only be
+    the last thing in the file: when complete records follow, recovery must refuse.
+    """
+    def fresh(port):
+        e = wal_engine(d, port)
+        s = e.load()
+        for i, k in enumerate("abc"):
+            s[k] = str(i); e.commit(s, [st.WalRecord(0, i, 1, "set", k, str(i))])
+        e.close()
+        return os.path.join(d, f"wal_{port}.log")
+
+    def frame_offsets(path):
+        data = open(path, "rb").read()
+        pos, offsets = 0, []
+        while pos < len(data):
+            (plen,) = st._HEADER.unpack(data[pos + 4:pos + 8])
+            offsets.append(pos)
+            pos += 8 + plen + 4
+        return offsets
+
+    def corrupt_length(path, frame_offset, new_len):
+        with open(path, "r+b") as f:
+            f.seek(frame_offset + 4)
+            f.write(st._HEADER.pack(new_len))
+
+    def load_raises(port):
+        try:
+            wal_engine(d, port).load()
+        except st.StorageCorruptionError:
+            return True
+        return False
+
+    # (a) The middle record claims 16 MiB it does not have: under the 64 MiB cap,
+    #     but past the end of the file.
+    walp = fresh(161)
+    middle = frame_offsets(walp)[1]
+    corrupt_length(walp, middle, 16 * 1024 * 1024 + 40)
+    before = open(walp, "rb").read()
+    check("interior length corrupted past EOF raises rather than truncating", load_raises(161))
+    check("the WAL is left untouched after that refusal",
+          open(walp, "rb").read() == before,
+          f"size {len(before)} -> {os.path.getsize(walp)}")
+
+    # (b) The middle record claims exactly enough to leave no room for its CRC.
+    walp = fresh(162)
+    middle = frame_offsets(walp)[1]
+    corrupt_length(walp, middle, os.path.getsize(walp) - (middle + 8) - 2)
+    check("interior length that swallows the CRC raises rather than truncating", load_raises(162))
+
+    # (c) Control: a torn final record whose partial payload contains the frame magic
+    #     is still a torn tail, because nothing complete follows it.
+    e = wal_engine(d, 163)
+    s = e.load()
+    s["a"] = "1"; e.commit(s, [st.WalRecord(0, 0, 1, "set", "a", "1")])
+    s["b"] = "x" + st._WAL_MAGIC.decode() + "y"
+    e.commit(s, [st.WalRecord(0, 1, 1, "set", "b", s["b"])])
+    e.close()
+    walp = os.path.join(d, "wal_163.log")
+    with open(walp, "r+b") as f:
+        f.truncate(os.path.getsize(walp) - 3)
+    e2 = wal_engine(d, 163)
+    s2 = e2.load()
+    e2.close()
+    check("a torn tail containing the magic bytes is still repaired as a tail",
+          s2 == {"a": "1"}, str(s2))
 
 
 # ── 9. invalid checkpoint ───────────────────────────────────
@@ -504,7 +578,7 @@ def t_sigkill_recovery(d):
 UNIT_TESTS = [
     t_set_recovery, t_delete_recovery, t_multi_shard, t_batch_recovery,
     t_txn_recovery, t_idempotent_replay, t_partial_tail, t_checksum_corruption,
-    t_invalid_checkpoint, t_checkpoint_and_stale_wal, t_rotation_recovery,
+    t_interior_length_corruption, t_invalid_checkpoint, t_checkpoint_and_stale_wal, t_rotation_recovery,
     t_json_backend, t_repeated_start_stop, t_committed_only_and_applied_index,
 ]
 

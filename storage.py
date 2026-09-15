@@ -286,7 +286,9 @@ class WalStorageEngine(StorageEngine):
         """Replay the WAL in file order and update ``store`` and ``_applied``.
 
         A partial final record ends replay after the valid prefix. Interior CRC
-        or alignment errors raise ``StorageCorruptionError``. Records at or
+        or alignment errors raise ``StorageCorruptionError``, and so does a
+        frame that overruns the file while complete records still follow it:
+        only a frame with nothing valid behind it is a torn tail. Records at or
         below a shard's applied index are skipped idempotently.
         """
         with open(self._wal_path, "rb") as f:
@@ -318,15 +320,22 @@ class WalStorageEngine(StorageEngine):
                     f"invalid WAL record length {plen} at offset={pos - 4}; "
                     "possible interior corruption")
 
-            # Read the payload.
-            if n - pos < plen:
-                break  # Declared length exceeds the remaining tail.
+            if n - pos < plen + 4:
+                # The declared payload and CRC run past the end of the file. A torn
+                # final frame looks exactly like this, but so does an interior record
+                # whose length field was corrupted upward. A torn frame is by
+                # definition the last thing in the file, so a complete CRC-valid
+                # frame anywhere after this header proves the length is wrong and
+                # the records behind it must not be discarded.
+                if self._complete_frame_follows(data, pos):
+                    raise StorageCorruptionError(
+                        f"WAL record length {plen} at offset={pos - 4} overruns the file "
+                        "but complete records follow it; possible interior corruption")
+                break  # Truncated tail.
+
+            # Read the payload and the CRC.
             payload = data[pos:pos + plen]
             pos += plen
-
-            # Read the CRC.
-            if n - pos < 4:
-                break  # Truncated tail.
             (crc_stored,) = _HEADER.unpack(data[pos:pos + 4])
             pos += 4
 
@@ -356,6 +365,30 @@ class WalStorageEngine(StorageEngine):
             # broken tail and every subsequent replay would stop before reaching them.
             with open(self._wal_path, "r+b") as f:
                 f.truncate(valid_end)
+
+    @staticmethod
+    def _complete_frame_follows(data: bytes, start: int) -> bool:
+        """Return True if a complete, CRC-valid frame begins at or after ``start``.
+
+        Used only when a frame overruns the file. Magic bytes inside a payload
+        are not enough on their own: the length after them must fit and the CRC
+        must match, so a torn tail that happens to contain the magic string is
+        still recognized as a tail.
+        """
+        n = len(data)
+        at = data.find(_WAL_MAGIC, start)
+        while at != -1:
+            head = at + len(_WAL_MAGIC)
+            if n - head >= _HEADER.size:
+                (plen,) = _HEADER.unpack(data[head:head + _HEADER.size])
+                body = head + _HEADER.size
+                if plen <= _MAX_RECORD_BYTES and n - body >= plen + _HEADER.size:
+                    payload = data[body:body + plen]
+                    (crc,) = _HEADER.unpack(data[body + plen:body + plen + _HEADER.size])
+                    if (zlib.crc32(payload) & 0xFFFFFFFF) == crc:
+                        return True
+            at = data.find(_WAL_MAGIC, at + 1)
+        return False
 
     def _apply_record_to_store(self, store: dict[str, str], rec: WalRecord) -> None:
         prev = self._applied.get(rec.shard_id, -1)

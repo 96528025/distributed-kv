@@ -40,8 +40,8 @@ jobs:
         run: python3 -m unittest -v test_metrics.py
 
       # This step spins up a real 3-node cluster on localhost:5001-5003 and runs all
-      # 56 integration checks. It is intentionally NOT a lint or syntax check.
-      - name: Run full integration suite (56 checks)
+      # 58 integration checks. It is intentionally NOT a lint or syntax check.
+      - name: Run full integration suite (58 checks)
         run: python3 test_raft_sharded.py
 
       # Safety regression suite. Each check maps to a named invariant in
@@ -70,7 +70,7 @@ jobs:
       # Storage layer: WAL framing and checksum replay, atomic checkpoint
       # publication, and a real 3-node cluster on 6301-6303 taken down twice
       # with SIGKILL. Runs entirely inside its own temp dirs.
-      - name: Run WAL and checkpoint suite (17 checks)
+      - name: Run WAL and checkpoint suite (21 checks)
         run: python3 test_wal.py
 
       # Applied-state regressions for case C11: in-process checks of ordered,

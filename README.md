@@ -19,7 +19,7 @@ The project demonstrates **distributed-systems implementation, storage engineeri
 | Ordered application | Applies every entry covered by a commit, including earlier entries whose client requests timed out | `apply_committed`; [`test_apply_order.py`](test_apply_order.py) |
 | Operational visibility | Dependency-free Prometheus counters, gauges, and histograms with bounded labels | [`metrics.py`](metrics.py), [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 
-CI runs **146 checks across nine suites on both Python 3.12 and 3.14**, including real node processes, leader suspension, full-cluster process kills, and disk corruption. These are scenario-specific regressions; they do not establish complete Raft safety or production readiness.
+CI runs **152 checks across nine suites on both Python 3.12 and 3.14**, including real node processes, leader suspension, full-cluster process kills, and disk corruption. These are scenario-specific regressions; they do not establish complete Raft safety or production readiness.
 
 ## Run in five minutes
 
@@ -120,9 +120,9 @@ python3 test_timers.py
 
 | Suite | Checks | Evidence |
 | --- | ---: | --- |
-| `test_raft_sharded.py` | 56 | Three-node integration: elections, forwarding, snapshots, follower restart, transactions, reads, batched writes/deletes |
+| `test_raft_sharded.py` | 58 | Three-node integration: elections, forwarding, snapshots, follower restart, transactions, reads, batched writes/deletes |
 | `test_raft_correctness.py` | 24 | One real node with scripted peers: term/vote crash recovery, log freshness, snapshot boundary, topology rejection |
-| `test_wal.py` | 17 | WAL replay, corruption, torn tails, rotation, checkpoints; three-node cluster killed twice with `SIGKILL` |
+| `test_wal.py` | 21 | WAL replay, corruption, torn tails, rotation, checkpoints; three-node cluster killed twice with `SIGKILL` |
 | `test_http_contract.py` | 13 | Single-node election, malformed client input, URL-encoded keys |
 | `test_apply_order.py` | 13 | Ordered/idempotent application, earlier timed-out entries, restart, compaction, snapshot catch-up |
 | `test_metrics.py` | 9 | Metric primitives, concurrency, hooks, live scrape |

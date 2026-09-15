@@ -64,6 +64,18 @@ def http_post(port, path, data, timeout=3):
     except Exception as e:
         return None
 
+def http_status(port, path, timeout=3):
+    """Return ``(status, body)``; an HTTP error status is an answer, not a failure."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}{path}", timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        with e:
+            raw = e.read()
+        return e.code, json.loads(raw) if raw else {}
+    except Exception:
+        return None, None
+
 def check(name, ok, detail=""):
     tag = PASS if ok else FAIL
     print(f"  {tag}  {name}")
@@ -486,6 +498,22 @@ r = http_get(leader_lk, "/get?key=linear_key")
 check(f"leader {leader_lk} reads directly, without forwarded_by",
       r and "forwarded_by" not in r,
       str(r))
+
+# A missing key must get the same answer through a follower as from the leader: the
+# leader's 404 relayed with forwarded_by, not a 503 "leader unreachable".
+missing = "missing_key_via_follower"
+sid_missing = int(hashlib.md5(missing.encode()).hexdigest(), 16) % len(PORTS)
+leader_missing = health()["shards"][str(sid_missing)]["leader"]
+follower_missing = next(p for p in PORTS if p != leader_missing)
+s_direct, b_direct = http_status(leader_missing, f"/get?key={missing}")
+check(f"leader {leader_missing} answers 404 for a missing key",
+      s_direct == 404 and "not found" in (b_direct or {}).get("error", ""),
+      f"status={s_direct}, body={b_direct}")
+s_fwd, b_fwd = http_status(follower_missing, f"/get?key={missing}")
+check(f"non-leader {follower_missing} relays the leader's 404 for a missing key, with forwarded_by",
+      s_fwd == 404 and (b_fwd or {}).get("forwarded_by") == follower_missing
+      and "not found" in (b_fwd or {}).get("error", ""),
+      f"status={s_fwd}, body={b_fwd}")
 
 # On a healthy cluster, a write followed by a quorum-validated Leader read returns
 # the latest value. This happy-path check is not a complete linearizability proof.
