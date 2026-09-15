@@ -4,16 +4,16 @@
 [![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?logo=python&logoColor=white)](https://github.com/96528025/distributed-kv/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**A three-process key-value store built in standard-library Python to explore replication, leader failure, and crash recovery.** Clients can contact any node; the node routes each key to its shard leader, which replicates writes to a majority before reporting success. An optional write-ahead log restores committed data after process crashes.
+A Python key-value store with per-shard leaders, replicated in-memory logs, batched writes, and an optional write-ahead log for local applied-state recovery. The default demo runs three processes on one machine and accepts client requests at any node.
 
-The project demonstrates **distributed-systems implementation, storage engineering, failure injection, and observability**. It implements a documented subset of Raft, with remaining safety gaps tracked explicitly. The three shards distribute leadership and replication work; every node still stores every key.
+Each node stores every key. Sharding separates coordination groups; it does not partition storage capacity. The implementation covers a documented subset of Raft, with open safety issues tracked in [RAFT_CORRECTNESS.md](docs/RAFT_CORRECTNESS.md).
 
 ## Engineering highlights
 
 | Capability | What the code does | Where to inspect it |
 | --- | --- | --- |
 | Replicated writes | Per-shard leader routing, concurrent peer RPCs, majority acknowledgements, batches of up to 20 queued operations | [`node_raft_sharded.py`](node_raft_sharded.py): `batch_loop`, `_handle_set`, `_handle_delete` |
-| Election recovery | Persists each shard's term and vote before dependent replies; refuses stale-log candidates and invalid persisted topology | `persist_hard_state`, `_handle_vote`; [`test_raft_correctness.py`](test_raft_correctness.py) |
+| Election recovery | Persists each shard's term and vote before dependent replies; refuses stale-log candidates and a changed persisted shard count | `persist_hard_state`, `_handle_vote`; [`test_raft_correctness.py`](test_raft_correctness.py) |
 | Stale-leader rejection | Requires same-term quorum confirmation before a leader serves `/get`; an isolated old leader returns `503` | `confirm_read_quorum`; [`test_read_quorum.py`](test_read_quorum.py) |
 | Storage recovery | CRC32-framed committed-operation WAL, SHA-256-verified checkpoints, torn-tail recovery, idempotent replay | [`storage.py`](storage.py), [`test_wal.py`](test_wal.py) |
 | Ordered application | Applies every entry covered by a commit, including earlier entries whose client requests timed out | `apply_committed`; [`test_apply_order.py`](test_apply_order.py) |
@@ -69,6 +69,8 @@ Each process hosts all three shard groups. Each group has its own term, vote, le
 
 **Write.** A follower forwards the request to its known shard leader. The leader appends queued operations, sends its retained log window to peers concurrently, waits up to one second for a majority, and applies/persists committed entries before replying. A timeout leaves the entries in the log: a later successful replication round may commit them. There is no client request-ID deduplication, so a timeout is not proof that a write was aborted.
 
+Followers relay the leader's HTTP status and JSON object response, adding `forwarded_by`. A missing key returns `404` through either the leader or a follower. An unreachable leader or an unusable upstream response produces `503`. The forwarding timeout is 0.5 seconds, while the leader's majority wait can take up to one second; a forwarded request can therefore time out before the leader finishes. A timeout does not establish whether a write was committed.
+
 **Read.** A follower forwards `/get`. The leader probes peers with current-term `AppendEntries`, checks that a majority still recognizes its term, and steps down if a higher term is observed. This prevents the tested isolated-old-leader stale read. It is a quorum-validated leader read, with full ReadIndex/application-barrier semantics still open.
 
 **Compaction.** A shard whose log exceeds 20 entries may compact its applied prefix. A follower behind the retained window can install a snapshot. Snapshots currently contain the shared store, so shard isolation during snapshot installation remains a tracked correctness gap.
@@ -83,7 +85,11 @@ Each process hosts all three shard groups. Each group has its own term, vote, le
 | Raft snapshot | Compacted state for follower catch-up | Stores the compaction boundary; current shared-store snapshot scope is tracked as C7 |
 | State-machine WAL | Restores committed key-value operations | Frames contain magic, length, versioned JSON, and CRC32; optional per-commit `fsync` |
 
-The WAL is **not a durable Raft replication log**: uncommitted Raft entries are not persisted. Checkpoints record the store and per-shard applied indexes, use a SHA-256 digest, and publish via `fsync` plus atomic rename before truncating the WAL. Rotation occurs at 1,000 records or 8 MiB. Replay skips already-applied indexes, trims an incomplete final frame, and rejects detected corruption rather than guessing.
+The WAL is **not a durable Raft replication log**: uncommitted Raft entries are not persisted. Checkpoints record the store and per-shard applied indexes, use a SHA-256 digest, and publish via `fsync` plus atomic rename before truncating the WAL. Rotation occurs at 1,000 records or 8 MiB. Replay skips already-applied indexes.
+
+The WAL persists local applied operations, not the Raft replication log. Recovery rejects checksum failures, invalid frame boundaries, implausible lengths, and a frame length that overruns the file when a later complete CRC-valid frame is present. Recovery leaves the WAL unchanged when it rejects corruption. An incomplete final frame may be truncated to the last valid boundary. The length field is not checksummed, so these rules do not detect every possible corruption pattern.
+
+Persisted Raft hard state includes the term and vote. Startup checks the stored shard count; it does not validate a complete membership identity.
 
 Default WAL appends flush to the OS; `KV_FSYNC=1` requests stronger disk durability. Process-kill tests exercise process-crash recovery, not physical power-loss recovery. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for locking and persistence ordering.
 
@@ -130,7 +136,9 @@ python3 test_timers.py
 | `test_timers.py` | 5 | Wall-clock changes do not change election or lock-lease timing |
 | `test_read_quorum.py` | 4 | Quorum decisions and real `SIGSTOP`/`SIGCONT` stale-leader regression |
 
-The process-based suites manage local node processes and fixed ports; run them in an isolated checkout without another demo cluster using those ports.
+The test suites exercise real node processes, leader suspension, process restarts, WAL corruption, checkpoint recovery, HTTP contracts, transactions, and ordered application. The checks establish the behavior of those scenarios; they do not prove complete Raft safety.
+
+`test_raft_sharded.py` prints its passing-check count and exits unsuccessfully if any check fails. It manages only the node processes it starts and keeps generated state in a temporary directory. Cleanup does not terminate nodes from other checkouts.
 
 ## Measured performance and its limits
 

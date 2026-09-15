@@ -70,7 +70,7 @@ The run used 1,500 requests per test and five repetitions per comparison point.
 |---|---:|---:|---:|---:|---:|---|
 | **`/get` (historical leader-routed read)** | **~2,400 ops/s** | 16 ms | 36 ms | 124 ms | 238 ms | Direct leader routing and an in-memory read; this run predates the current quorum-validation barrier. |
 | **`/set` (batched write)** | ~700 ops/s | 27 ms | 149 ms | 375 ms | 2.0 s | Batch queue, Raft replication, and full-store persistence. |
-| **`/txn` (cross-shard 2PC)** | **~45 ops/s** | 890 ms | 2.4 s | 3.1 s | 6.3 s | Prepare and commit across participants; some requests aborted under load. |
+| **`/txn` (cross-shard 2PC)** | **40.5 ops/s** | 890 ms | 2.4 s | 3.1 s | 6.3 s | Prepare and commit across participants; some requests aborted under load. |
 
 ![Latency distribution by operation](latency_distribution.png)
 
@@ -78,14 +78,14 @@ In this historical run, reads were faster than writes, and transactions were
 the slowest path. The paths perform materially different work, and the read
 number does not include the quorum-validation cost in the current implementation.
 
-### 2. Batch-write comparison
+### 2. Client-concurrency comparison
 
 | Scenario | Throughput | p50 | p99 |
 |---|---:|---:|---:|
 | Serial writes (concurrency 1; one request per Raft round) | ~190 ops/s | 5 ms | 12 ms |
 | Concurrent writes (concurrency 50; up to 20 requests drained from the queue per round) | ~647 ops/s median (250–1,480 across five trials) | 22 ms | 358 ms |
 
-![Batch-write comparison](batch_effect.png)
+![Write throughput by client concurrency](batch_effect.png)
 
 In the recorded median run, concurrent load raised write throughput 3.37x
 (192 -> 647 ops/s) while increasing tail latency; the five concurrent trials spanned

@@ -109,13 +109,8 @@ batch size.
 
 - The tables are the **median** of 3 runs per point; `storage_results_*.json` also stores
   `throughput_min/max`.
-- On a single machine with the OS page cache, absolute throughput fluctuates with background
-  load (WAL single-write throughput moves between roughly 60k and 90k ops/s). The
-  **relative** conclusions — JSON degrading linearly with scale, WAL staying flat — hold in
-  every run.
-- fsync=off: `flush()` hands data to the OS page cache, which is enough to survive a
-  **process crash or SIGKILL** (see test 14 in `test_wal.py`). Surviving **power loss**
-  requires `--fsync`, which reduces throughput noticeably by adding a disk sync per write;
-  save a separate `storage_results_<date>_fsync.*` to compare.
+- In the recorded workloads, rewriting the JSON store became more expensive as the store grew, while appending WAL records avoided rewriting the full store on each commit. These measurements do not establish constant WAL cost for every workload: checkpoints, rotation, record size, and synchronization also contribute to cost.
+
+- With fsync disabled, flushed data may remain in the operating system's page cache. Process-kill recovery tests do not simulate power loss. Enabling `--fsync` adds synchronization calls, but this repository has not established a power-loss guarantee across filesystems and storage devices.
 - This is a **storage-layer microbenchmark**. It does not represent end-to-end cluster
   throughput, which is still dominated by HTTP, Raft and the GIL — see the project README.
