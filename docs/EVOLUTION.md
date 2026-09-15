@@ -24,8 +24,8 @@ each shard. Different shard leaders can therefore execute replication rounds ind
 
 This is static modulo sharding, not consistent hashing. Every node still stores the full
 logical data set, and changing the shard count has no migration protocol. The benchmark
-also shows that independent groups do not create useful parallelism when all server
-processes share one laptop and batch depth falls as traffic spreads across shards.
+did not show a throughput gain from spreading keys across shard groups on one laptop.
+Batch depth and leader placement were not recorded, so the result does not isolate a cause.
 
 ## Full JSON rewrites to WAL and checkpoints
 

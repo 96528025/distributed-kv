@@ -10,8 +10,10 @@ python3 benchmark_storage.py --fsync            # run again with fsync enabled
 python3 benchmark_storage.py --scales=100,1000
 ```
 
-Raw results are saved under a **date plus fsync marker** and never overwrite an existing
-file: `storage_results_<date>.json` and `storage_results_<date>.csv`.
+Raw results use the local date and an optional `_fsync` suffix, for example
+`storage_results_2026-09-15_fsync.json` and the matching CSV. Repeating a run on the
+same date with the same fsync setting replaces those files. Use `--no-save` for
+smoke checks or copy a run before repeating it.
 
 ---
 
@@ -62,9 +64,10 @@ batching rows may differ from this historical data; rerun the script for current
    entries (500x), JSON single-write throughput falls from 1400 to 28 ops/s (about 50x
    worse) and p50 rises from 0.72ms to 35ms (about 49x worse). That is exactly the O(N)
    cost of calling `json.dump(entire store)` on every commit.
-2. **A WAL single write is independent of data size.** Across the same 100 to 50,000 range
-   the WAL p50 stays at **0.008ms**, because it only appends one fixed-frame record. At the
-   50k scale a WAL write is roughly **1000x** faster than a JSON write.
+2. **WAL median append latency stayed approximately flat in this run.** Across the
+   100 to 50,000-entry range, its p50 is approximately **0.008 ms**. At 50,000 entries,
+   storage-only throughput is about **1,021x** the JSON result (28,595 / 28 ops/s),
+   with `fsync` disabled. This ratio includes checkpoint cost and is not a cluster speedup.
 3. **First cost: slightly more disk.** The WAL is an append log and is a little larger than
    compact JSON (50k: 1728KB vs 1628KB), but checkpoint rotation caps that (see below).
 4. **Second cost: recovery has to replay.** WAL recovery (checkpoint plus replay) is
@@ -77,9 +80,10 @@ Not write amplification — **checkpoint rotation**. This benchmark uses
 `rotate_records=1000` and each point writes exactly 1000 records, so every point triggers
 **one** checkpoint, and that one checkpoint rewrites the whole store (O(N)).
 
-At scale=50k that single O(50k) checkpoint (about 20ms) is amortized over 1000 writes,
-lifting total time from "1000 x 0.008ms = 8ms" to roughly 28ms, and throughput drops
-accordingly.
+At scale=50k, 28,595 ops/s implies about 35 ms for 1,000 writes. The roughly
+8 ms obtained by multiplying the median append latency by 1,000 is not a measured
+total. Checkpoint work and other overhead contribute to the difference; the saved
+results do not report checkpoint duration separately.
 
 This is precisely the WAL design trade-off: **the O(N) full flush moves from "every write"
 to "once every rotate_records writes."** A larger `rotate_records` means rarer checkpoints
@@ -100,8 +104,8 @@ rotation is a spike.
 | WAL  | 50 | 159,656 | 0.005ms | 0.007ms |
 
 Batching helps **both backends** — JSON collapses B full rewrites into one, and the WAL
-writes B frames in a single flush — but the WAL stays an order of magnitude faster at every
-batch size.
+writes B frames in a single flush — and the recorded WAL/JSON throughput ratios are approximately 103x, 19.7x,
+and 4.4x at batch sizes 1, 10, and 50, respectively.
 
 ---
 

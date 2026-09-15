@@ -49,9 +49,10 @@ then resumes only the isolated old Leader and verifies it returns HTTP 503 inste
 ## Why this is not full ReadIndex
 
 This barrier closes the isolated-old-Leader stale-read path, but complete linearizability
-also depends on unfinished Raft invariants, including election log freshness, current-term
-commit rules, conflict repair, correct commit/apply tracking, and durable term/vote/log
-state. The accurate claim is therefore “quorum-validated Leader reads,” not a complete
+also depends on the open current-term commit rule, conflict repair, durable Raft log,
+shard-scoped snapshots, and read application barrier. Term/vote persistence and candidate
+log-freshness checks already have targeted regressions (C1/C2 in the correctness log).
+The accurate claim is therefore “quorum-validated Leader reads,” not a complete
 production Raft ReadIndex implementation.
 
 The implementation also sends the current log window during each probe. That fits this
