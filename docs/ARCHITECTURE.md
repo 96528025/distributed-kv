@@ -90,7 +90,9 @@ implemented. The current API must not be treated as exactly-once.
 Reads route to the shard leader. Before returning its local value, the leader probes a
 majority in its current term. If it cannot confirm a majority, it refuses the read. This
 prevents the demonstrated stale-old-leader failure in which a partitioned former leader
-continues serving old state.
+continues serving old state. A follower relays the leader's status code and body
+unchanged, adding `forwarded_by`, so a missing key is a 404 through any node; 503
+`leader unreachable` is reserved for a transport failure.
 
 This barrier is narrower than the Raft ReadIndex protocol. It does not independently prove
 that the leader has applied every committed entry before reading. Complete linearizability
@@ -128,7 +130,8 @@ and must not be conflated.
 
 The WAL uses length-prefixed, checksummed frames. Recovery ignores and truncates only a
 partial final frame; a bad checksum, impossible length or broken frame boundary fails
-closed. Checkpoint publication is ordered as `write temp -> fsync -> atomic replace ->
+closed, and so does a frame that overruns the file while complete records still follow
+it, since a torn frame can only be the last thing in the file. Checkpoint publication is ordered as `write temp -> fsync -> atomic replace ->
 fsync directory -> truncate WAL`, so a crash on either side of publication leaves at least
 one replayable source of truth.
 
